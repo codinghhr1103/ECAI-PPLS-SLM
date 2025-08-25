@@ -1,0 +1,27 @@
+# Core numerical and scientific computing
+numpy
+scipy
+scikit-learn
+
+# Data manipulation and analysis
+pandas
+
+# Visualization
+matplotlib
+seaborn
+openpyxl
+
+# Progress bar
+tqdm
+
+# Parallel processing
+joblib
+
+# Optional: For better performance
+numba  # Optional: JIT compilation for speed
+
+# Development tools (optional)
+pytest  # For testing
+black  # Code formatting
+flake8  # Code linting
+jupyter  # For interactive exploration
