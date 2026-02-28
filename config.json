@@ -51,11 +51,11 @@
   },
   "output": {
     "save_intermediate": true,
-    "base_dir": "C:/Users/hhrh1/Desktop/experiment_data",
+    "base_dir": "C:/Users/ASUS/Desktop/output",
     "figure_format": "png",
     "force_data_generation": false,
     "force_parameter_estimation": false,
-    "force_visualization": false
+    "force_visualization": true
   },
   "analysis": {
     "compute_bias_variance": true,

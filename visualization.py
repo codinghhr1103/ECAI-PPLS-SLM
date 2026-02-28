@@ -134,12 +134,12 @@ class PPLSVisualizer:
         )
         
         # Save figures with publication-quality naming
-        filename_W = f'Figure_2_Loading_W_Component_{component_idx+1}.{self.figure_format}'
+        filename_W = f'loading_W_Component_{component_idx+1}.{self.figure_format}'
         fig_W.savefig(os.path.join(self.figure_dir, filename_W), 
                      bbox_inches='tight', dpi=300, facecolor='white')
         plt.close(fig_W)
         
-        filename_C = f'Figure_3_Loading_C_Component_{component_idx+1}.{self.figure_format}'
+        filename_C = f'loading_C_Component_{component_idx+1}.{self.figure_format}'
         fig_C.savefig(os.path.join(self.figure_dir, filename_C), 
                      bbox_inches='tight', dpi=300, facecolor='white')
         plt.close(fig_C)
