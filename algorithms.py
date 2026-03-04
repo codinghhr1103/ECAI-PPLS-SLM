@@ -175,9 +175,26 @@ class ScalarLikelihoodMethod(PPLSAlgorithm):
             'maxiter': self.max_iter, 'gtol': 1e-3, 'xtol': 1e-3,
             'barrier_tol': 1e-3, 'initial_constr_penalty': 1.0,
         }
-        return minimize(objective.scalar_log_likelihood, theta0,
-                        method=self.optimizer, constraints=constraints,
-                        bounds=bounds, options=options)
+
+        # SciPy trust-constr sometimes emits:
+        #   UserWarning: delta_grad == 0.0. Check if the approximated function is linear...
+        # This is usually harmless (it just means a quasi-Newton Hessian update had no
+        # gradient-change information in one step). We silence it to keep experiment logs clean.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"delta_grad == 0\.0.*",
+                category=UserWarning,
+            )
+            return minimize(
+                objective.scalar_log_likelihood,
+                theta0,
+                method=self.optimizer,
+                constraints=constraints,
+                bounds=bounds,
+                options=options,
+            )
+
 
     def _select_best_solution(self, solutions):
         if not solutions:

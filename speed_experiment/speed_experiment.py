@@ -30,20 +30,22 @@ import os
 #  CONFIG  –  all tunable parameters live here
 # ======================================================================
 CONFIG = {
-    # Grid of p and q values to sweep (p == q assumed in each run)
-    "pq_values": [50, 100, 200, 500, 1000],
+    # Grid of p and q values to sweep.
+    # NOTE: The original grid (up to 1000) can be extremely slow on many machines.
+    # This default is intentionally smaller so the experiment finishes in a reasonable time.
+    "pq_values": [20, 50, 100, 150, 200],
 
     # Latent dimensions to evaluate; each value produces one heatmap panel
-    "r_values": [5, 10, 20],
+    "r_values": [5, 10],
 
     # Number of timed repetitions per (p, q, r) configuration
-    "n_repetitions": 100,
+    "n_repetitions": 30,
 
     # Random seed for reproducibility
     "random_seed": 42,
 
     # Output file path for the combined heatmap figure
-    "output_path": "speed_comparison.png",
+    "output_path": "output/figures/speed_comparison.png",
 
     # Figure size (width, height) in inches
     "figure_size": (14, 4.5),
@@ -342,6 +344,10 @@ def plot_results(results: dict, cfg: dict):
         "Speedup Factor: Matrix Form vs Scalar Form Likelihood Evaluation",
         fontsize=12, fontweight="bold", y=1.02,
     )
+
+    out_dir = os.path.dirname(out_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
 
     fig.savefig(out_path, dpi=cfg["figure_dpi"],
                 bbox_inches="tight", facecolor="white")

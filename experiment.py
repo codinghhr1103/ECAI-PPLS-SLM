@@ -55,13 +55,165 @@ PerformanceMetrics.compute_mse() → ParameterRecovery.align_estimated_params()
 
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional
 import json
 import pickle
 import os
 import time
 from datetime import datetime
 import warnings
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+
+_WORKER_CTX: Dict[str, Any] = {}
+
+
+def _init_trial_worker(
+    config: Dict,
+    true_params: Dict,
+    starting_points: List[np.ndarray],
+    p: int,
+    q: int,
+    r: int,
+    results_dir: str,
+    save_intermediate: bool,
+):
+    """Initializer for worker processes (Windows spawn-safe).
+
+    Keeps large shared objects (config / true_params / starting_points) in a module-level
+    context to avoid re-sending them for every single trial.
+    """
+    global _WORKER_CTX
+    _WORKER_CTX = {
+        "config": config,
+        "true_params": true_params,
+        "starting_points": starting_points,
+        "p": p,
+        "q": q,
+        "r": r,
+        "results_dir": results_dir,
+        "save_intermediate": save_intermediate,
+    }
+
+
+def _run_trial_worker(trial_id: int, X: np.ndarray, Y: np.ndarray, seed: int) -> Optional[Dict]:
+    """Run one trial in a worker process and return the same trial_result structure."""
+    ctx = _WORKER_CTX
+    try:
+        # Ensure deterministic per-trial randomness in each process.
+        np.random.seed(seed)
+
+        config = ctx["config"]
+        true_params = ctx["true_params"]
+        starting_points = ctx["starting_points"]
+        p, q, r = ctx["p"], ctx["q"], ctx["r"]
+        results_dir = ctx["results_dir"]
+        save_intermediate = bool(ctx.get("save_intermediate", True))
+
+        # Instantiate algorithms inside the process.
+        slm = ScalarLikelihoodMethod(
+            p=p,
+            q=q,
+            r=r,
+            optimizer=config["algorithms"]["slm"]["optimizer"],
+            max_iter=config["algorithms"]["slm"]["max_iter"],
+            use_noise_preestimation=config["algorithms"]["slm"]["use_noise_preestimation"],
+        )
+        em = EMAlgorithm(
+            p=p,
+            q=q,
+            r=r,
+            max_iter=config["algorithms"]["em"]["max_iter"],
+            tolerance=config["algorithms"]["em"]["tolerance"],
+        )
+        ecm = ECMAlgorithm(
+            p=p,
+            q=q,
+            r=r,
+            max_iter=config["algorithms"]["ecm"]["max_iter"],
+            tolerance=config["algorithms"]["ecm"]["tolerance"],
+        )
+
+        # Run algorithms and collect timing.
+        slm_start_time = time.time()
+        slm_results = slm.fit(X, Y, starting_points)
+        slm_time = time.time() - slm_start_time
+
+        em_start_time = time.time()
+        em_results = em.fit(X, Y, starting_points)
+        em_time = time.time() - em_start_time
+
+        ecm_start_time = time.time()
+        ecm_results = ecm.fit(X, Y, starting_points)
+        ecm_time = time.time() - ecm_start_time
+
+        slm_converged = 1 if slm_results.get("success", False) else 0
+        em_converged = 1 if em_results.get("log_likelihood", -np.inf) > -np.inf else 0
+        ecm_converged = 1 if ecm_results.get("log_likelihood", -np.inf) > -np.inf else 0
+
+        stats_summary = {
+            "trial_id": trial_id,
+            "slm": {
+                "runtime": slm_time,
+                "avg_time_per_start": slm_time / len(starting_points),
+                "converged": slm_converged,
+                "failed": 1 - slm_converged,
+                "convergence_rate": slm_converged / len(starting_points),
+                "best_objective": slm_results.get("objective_value", np.inf),
+                "avg_iterations": slm_results.get("n_iterations", 0),
+            },
+            "em": {
+                "runtime": em_time,
+                "avg_time_per_start": em_time / len(starting_points),
+                "converged": em_converged,
+                "failed": 1 - em_converged,
+                "convergence_rate": em_converged / len(starting_points),
+                "best_likelihood": em_results.get("log_likelihood", -np.inf),
+                "avg_iterations": em_results.get("n_iterations", 0),
+            },
+            "ecm": {
+                "runtime": ecm_time,
+                "avg_time_per_start": ecm_time / len(starting_points),
+                "converged": ecm_converged,
+                "failed": 1 - ecm_converged,
+                "convergence_rate": ecm_converged / len(starting_points),
+                "best_likelihood": ecm_results.get("log_likelihood", -np.inf),
+                "avg_iterations": ecm_results.get("n_iterations", 0),
+            },
+        }
+
+        if save_intermediate:
+            stats_file = os.path.join(results_dir, f"trial_{trial_id:03d}_statistics.json")
+            with open(stats_file, "w") as f:
+                json.dump(stats_summary, f, indent=4)
+
+        return {
+            "trial_id": trial_id,
+            "true_params": true_params,
+            "slm_results": slm_results,
+            "em_results": em_results,
+            "ecm_results": ecm_results,
+            "data_shape": {"X": X.shape, "Y": Y.shape},
+            "statistics": stats_summary,
+        }
+
+    except Exception as e:
+        # Mirror the sequential behavior: record an error file and return None.
+        error_info = {
+            "trial_id": trial_id,
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        try:
+            error_file = os.path.join(ctx.get("results_dir", "."), f"trial_{trial_id:03d}_error.json")
+            with open(error_file, "w") as f:
+                json.dump(error_info, f, indent=4)
+        except Exception:
+            pass
+        return None
+
 
 from algorithms import InitialPointGenerator, ScalarLikelihoodMethod, EMAlgorithm, ECMAlgorithm, NoiseEstimator
 from ppls_model import PPLSModel
@@ -73,7 +225,7 @@ class PPLSExperiment:
     Ensures fair comparison by using identical datasets and starting points.
     """
     
-    def __init__(self, config: Dict, base_dir: str, results_dir: str):
+    def __init__(self, config: Dict, base_dir: str, results_dir: str, data_dir: Optional[str] = None):
         """
         Initialize experiment with configuration and simplified directory structure.
         
@@ -85,10 +237,13 @@ class PPLSExperiment:
             Base directory containing data
         results_dir : str
             Directory to save results
+        data_dir : Optional[str]
+            Directory containing generated data files (defaults to base_dir/data)
         """
         self.config = config
         self.base_dir = base_dir
         self.results_dir = results_dir
+        self.data_dir = data_dir if data_dir is not None else os.path.join(self.base_dir, 'data')
         
         # Model parameters
         self.p = config['model']['p']
@@ -109,7 +264,7 @@ class PPLSExperiment:
         
     def _load_data_and_ground_truth(self):
         """Load experimental data and ground truth parameters from data directory."""
-        data_dir = os.path.join(self.base_dir, 'data')
+        data_dir = self.data_dir
         
         # Load data arrays
         self.X_trials = np.load(os.path.join(data_dir, 'X_trials.npy'))
@@ -127,6 +282,7 @@ class PPLSExperiment:
             raise ValueError(f"Y data shape mismatch: expected {expected_shape}, got {self.Y_trials.shape[:2]}")
             
         print(f"Loaded data for {self.n_trials} trials")
+        print(f"Data directory: {data_dir}")
         print(f"Data dimensions: X{self.X_trials.shape}, Y{self.Y_trials.shape}")
         
     def run_monte_carlo(self) -> Dict:
@@ -161,24 +317,79 @@ class PPLSExperiment:
         starting_points = init_generator.generate_starting_points()
         print(f"Generated {len(starting_points)} identical starting points for all trials")
         
-        # Run trials sequentially
-        print("Running trials sequentially...")
+        # Decide whether to parallelize trials (parameter-estimation stage)
+        exp_cfg = self.config.get("experiment", {})
+        parallel_trials = bool(exp_cfg.get("parallel_trials", False))
+        n_jobs = int(exp_cfg.get("n_jobs", 1))
+        if n_jobs == -1:
+            n_jobs = os.cpu_count() or 1
+        max_workers = max(1, min(n_jobs, self.n_trials))
+        save_intermediate = bool(self.config.get("output", {}).get("save_intermediate", True))
+
         trial_results = []
-        
-        for trial_id in range(self.n_trials):
-            print(f"\nRunning Trial {trial_id+1}/{self.n_trials}...")
-            
-            # Get data for this trial
-            X = self.X_trials[trial_id]
-            Y = self.Y_trials[trial_id]
-            
-            result = self._run_single_trial(trial_id, X, Y, self.true_params, starting_points)
-            
-            if result is not None:
-                trial_results.append(result)
-                print(f"✓ Trial {trial_id+1} completed successfully")
-            else:
-                print(f"✗ Trial {trial_id+1} failed")
+
+        if parallel_trials and max_workers > 1:
+            print(f"Running trials in parallel (workers={max_workers})...")
+
+            mp_ctx = multiprocessing.get_context("spawn")
+            with ProcessPoolExecutor(
+                max_workers=max_workers,
+                mp_context=mp_ctx,
+                initializer=_init_trial_worker,
+                initargs=(
+                    self.config,
+                    self.true_params,
+                    starting_points,
+                    self.p,
+                    self.q,
+                    self.r,
+                    self.results_dir,
+                    save_intermediate,
+                ),
+            ) as executor:
+                futures = []
+                for trial_id in range(self.n_trials):
+                    X = self.X_trials[trial_id]
+                    Y = self.Y_trials[trial_id]
+                    # Deterministic per-trial seed (independent of process scheduling)
+                    trial_seed = int(self.experiment_seed) + 2000 + int(trial_id)
+                    futures.append(executor.submit(_run_trial_worker, trial_id, X, Y, trial_seed))
+
+                completed = 0
+                progress_every = max(1, self.n_trials // 20)
+                for fut in as_completed(futures):
+                    completed += 1
+                    try:
+                        result = fut.result()
+                    except Exception as e:
+                        warnings.warn(f"Trial future failed: {e}")
+                        result = None
+
+                    if result is not None:
+                        trial_results.append(result)
+
+                    if completed % progress_every == 0 or completed == self.n_trials:
+                        print(f"  progress: {completed}/{self.n_trials}")
+
+        else:
+            # Run trials sequentially
+            print("Running trials sequentially...")
+
+            for trial_id in range(self.n_trials):
+                print(f"\nRunning Trial {trial_id+1}/{self.n_trials}...")
+
+                # Get data for this trial
+                X = self.X_trials[trial_id]
+                Y = self.Y_trials[trial_id]
+
+                result = self._run_single_trial(trial_id, X, Y, self.true_params, starting_points)
+
+                if result is not None:
+                    trial_results.append(result)
+                    print(f"[OK] Trial {trial_id+1} completed successfully")
+                else:
+                    print(f"[FAIL] Trial {trial_id+1} failed")
+
         
         # Filter out failed trials
         valid_results = [r for r in trial_results if r is not None]
@@ -231,7 +442,7 @@ class PPLSExperiment:
         }
         
         self.save_experiment_summary(experiment_results)
-        print("✓ Experiment summary saved\n")
+        print("[OK] Experiment summary saved\n")
         
         return experiment_results
         
@@ -408,10 +619,12 @@ class PPLSExperiment:
             }
         }
         
-        # Save statistics
-        stats_file = os.path.join(self.results_dir, f"trial_{trial_id:03d}_statistics.json")
-        with open(stats_file, 'w') as f:
-            json.dump(stats_summary, f, indent=4)
+        # Save per-trial statistics (optional)
+        if self.config.get('output', {}).get('save_intermediate', True):
+            stats_file = os.path.join(self.results_dir, f"trial_{trial_id:03d}_statistics.json")
+            with open(stats_file, 'w') as f:
+                json.dump(stats_summary, f, indent=4)
+
         
         return {
             'slm': slm_results,

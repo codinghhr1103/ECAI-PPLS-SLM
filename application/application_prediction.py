@@ -176,7 +176,10 @@ def predict_conditional_covariance(params: Dict) -> np.ndarray:
     term1 = C @ (B2Sigma_t + sigma_h2 * np.eye(r)) @ C.T + sigma_f2 * np.eye(q)
 
     # C B Σ_t W' Σ_xx^{-1} W Σ_t B C'
-    M = C @ B @ Sigma_t @ WtSig_inv.T @ Sigma_t @ B @ C.T   # (q,q)
+    # Note: WtSig_inv = Σ_xx^{-1} W  (p, r), so W' Σ_xx^{-1} W = W.T @ WtSig_inv (r, r).
+    K = W.T @ WtSig_inv
+    K = (K + K.T) / 2  # numerical symmetry
+    M = C @ B @ Sigma_t @ K @ Sigma_t @ B @ C.T   # (q,q)
 
     Cov = term1 - M
     # Symmetrise and regularise
@@ -406,7 +409,7 @@ def check_calibration(coverage_df: pd.DataFrame,
         nominal = (1 - alpha) * 100
         empirical = coverage_df[col].mean()
         diff = abs(empirical - nominal)
-        status = "✓" if diff <= tol else "✗"
+        status = "OK" if diff <= tol else "FAIL"
         print(f"  {col:14s}  nominal={nominal:.0f}%  empirical={empirical:.2f}%  "
               f"diff={diff:.2f}%  {status}")
         if diff > tol:

@@ -1,10 +1,53 @@
-__pycache__/algorithms.cpython-313.pyc
-__pycache__/data_generator.cpython-313.pyc
-__pycache__/experiment.cpython-313.pyc
-__pycache__/ppls_model.cpython-313.pyc
-__pycache__/visualization.cpython-313.pyc
-__pycache__/visualization.cpython-314.pyc
-__pycache__/ppls_model.cpython-314.pyc
-__pycache__/experiment.cpython-314.pyc
-__pycache__/data_generator.cpython-314.pyc
-__pycache__/algorithms.cpython-314.pyc
+# =====================================================================
+# Python
+# =====================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE / editor
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# =====================================================================
+# Experiment outputs (reproducible; do not commit)
+# =====================================================================
+output/
+results_association/
+results_prediction/
+# Legacy root-level speed figure (generated)
+speed_comparison.png
+
+# =====================================================================
+# Paper
+# =====================================================================
+# Ignore the entire paper folder (sources + artifacts + build outputs)
+paper/
+
+# =====================================================================
+# Local scratch / smoke tests
+# =====================================================================
+results_association_smoketest/
+
+# =====================================================================
+# Archives / local scratch (add project-specific patterns as needed)
+# =====================================================================
+# (Intentionally NOT ignoring all *.zip because the repo tracks datasets.)

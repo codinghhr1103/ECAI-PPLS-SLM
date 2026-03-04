@@ -168,6 +168,63 @@ def load_omics_data(gene_path: str, protein_path: str) -> Tuple[np.ndarray, np.n
     return X, Y, gene_names[:X.shape[1]], protein_names[:Y.shape[1]]
 
 
+def load_brca_data_w_subtypes(path: str) -> Tuple[np.ndarray, np.ndarray, List[str], List[str]]:
+    """Load the bundled BRCA dataset (705 samples) and split into genes/proteins.
+
+    The repo ships a preprocessed single-table dataset:
+      `application/brca_data_w_subtypes.csv.zip`
+
+    Columns are grouped by prefix:
+    - `rs_` : gene-expression features (604 columns)
+    - `pp_` : protein-expression features (223 columns)
+
+    Other columns (e.g., `cn_`, `mu_`, and clinical labels) are ignored for
+    the association-analysis experiment.
+
+    Returns
+    -------
+    X : (N, 604) ndarray
+    Y : (N, 223) ndarray
+    gene_names : list[str]
+    protein_names : list[str]
+    """
+    import io
+    import zipfile
+
+    p = path
+    lower = p.lower()
+
+    if lower.endswith('.zip'):
+        with zipfile.ZipFile(p) as z:
+            names = z.namelist()
+            if not names:
+                raise ValueError(f"Empty zip file: {p}")
+            # Expect a single CSV inside
+            csv_name = names[0]
+            data = z.read(csv_name)
+            df = pd.read_csv(io.BytesIO(data))
+    else:
+        df = pd.read_csv(p)
+
+    rs_cols = [c for c in df.columns if str(c).startswith('rs_')]
+    pp_cols = [c for c in df.columns if str(c).startswith('pp_')]
+
+    if len(rs_cols) == 0 or len(pp_cols) == 0:
+        raise ValueError(
+            "BRCA combined dataset does not contain expected `rs_` (genes) and `pp_` (proteins) columns. "
+            f"Found rs_={len(rs_cols)}, pp_={len(pp_cols)} in: {p}"
+        )
+
+    X = df[rs_cols].to_numpy(dtype=float)
+    Y = df[pp_cols].to_numpy(dtype=float)
+
+    # Z-score standardise across samples
+    X = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-10)
+    Y = (Y - Y.mean(axis=0)) / (Y.std(axis=0) + 1e-10)
+
+    return X, Y, rs_cols, pp_cols
+
+
 def simulate_omics_data(n_samples: int = 705,
                         n_genes: int = 604,
                         n_proteins: int = 223,
@@ -397,6 +454,8 @@ def run_association_analysis(
     subsample_seed: int = 42,
     algorithm_seed: int = 42,
     output_dir: str = "results_association",
+    slm_max_iter: int = 50,
+    em_max_iter: int = 200,
 ):
     """
     Full association-analysis pipeline.
@@ -441,7 +500,7 @@ def run_association_analysis(
 
     # ── 3. Fit PPLS with SLM ─────────────────────────────────────────────────
     print("\nFitting PPLS with SLM...")
-    slm = ScalarLikelihoodMethod(p=p, q=q, r=r, max_iter=100,
+    slm = ScalarLikelihoodMethod(p=p, q=q, r=r, max_iter=int(slm_max_iter),
                                  use_noise_preestimation=True)
     slm_res = slm.fit(X_s, Y_s, starting_points)
     print(f"  SLM done  |  iterations={slm_res['n_iterations']}"
@@ -449,7 +508,7 @@ def run_association_analysis(
 
     # ── 4. Fit PPLS with EM ──────────────────────────────────────────────────
     print("Fitting PPLS with EM...")
-    em = EMAlgorithm(p=p, q=q, r=r, max_iter=1000, tolerance=1e-4)
+    em = EMAlgorithm(p=p, q=q, r=r, max_iter=int(em_max_iter), tolerance=1e-4)
     em_res = em.fit(X_s, Y_s, starting_points)
     print(f"  EM done   |  iterations={em_res['n_iterations']}")
 
@@ -586,6 +645,8 @@ def parse_args():
                         help="CSV path for gene-expression (samples × genes).")
     parser.add_argument("--protein_expr", type=str, default=None,
                         help="CSV path for protein-expression (samples × proteins).")
+    parser.add_argument("--brca_data",    type=str, default=None,
+                        help="Path to bundled BRCA combined dataset (.csv or .zip).")
     parser.add_argument("--r",            type=int, default=10,
                         help="Number of latent variables (default: 10).")
     parser.add_argument("--n_samples",    type=int, default=100,
@@ -594,8 +655,12 @@ def parse_args():
                         help="Number of subsampled genes nGs (default: 100).")
     parser.add_argument("--n_proteins",   type=int, default=100,
                         help="Number of subsampled proteins nPs (default: 100).")
-    parser.add_argument("--n_starts",     type=int, default=32,
-                        help="Multi-start initializations (default: 32).")
+    parser.add_argument("--n_starts",     type=int, default=2,
+                        help="Multi-start initializations (default: 2).")
+    parser.add_argument("--slm_max_iter", type=int, default=50,
+                        help="SLM max iterations (default: 50).")
+    parser.add_argument("--em_max_iter",  type=int, default=200,
+                        help="EM max iterations (default: 200).")
     parser.add_argument("--output_dir",   type=str, default="results_association",
                         help="Directory to save results.")
     parser.add_argument("--seed",         type=int, default=42,
@@ -610,22 +675,33 @@ def main():
 
     # ── Load or simulate data ─────────────────────────────────────────────────
     if args.gene_expr is not None and args.protein_expr is not None:
-        print("Loading real omics data...")
+        print("Loading real omics data (two-file format)...")
         X_full, Y_full, gene_names, protein_names = load_omics_data(
             args.gene_expr, args.protein_expr
         )
         print(f"  Gene expression:    {X_full.shape}")
         print(f"  Protein expression: {Y_full.shape}")
+
     else:
-        print("No data paths provided — generating synthetic multi-omics data.")
-        print("(Pass --gene_expr and --protein_expr for real TCGA-BRCA data.)\n")
-        X_full, Y_full, gene_names, protein_names = simulate_omics_data(
-            n_samples=705, n_genes=604, n_proteins=223,
-            r_true=5, sigma_e2=0.5, sigma_f2=0.5, sigma_h2=0.1,
-            seed=args.seed,
-        )
-        print(f"  Simulated gene expression:    {X_full.shape}")
-        print(f"  Simulated protein expression: {Y_full.shape}")
+        # Prefer the bundled BRCA dataset if available.
+        default_brca_zip = os.path.join(os.path.dirname(__file__), "brca_data_w_subtypes.csv.zip")
+        brca_path = args.brca_data if args.brca_data is not None else (default_brca_zip if os.path.exists(default_brca_zip) else None)
+
+        if brca_path is not None:
+            print(f"Loading bundled BRCA combined dataset: {brca_path}")
+            X_full, Y_full, gene_names, protein_names = load_brca_data_w_subtypes(brca_path)
+            print(f"  Gene expression (rs_):   {X_full.shape}")
+            print(f"  Protein expression (pp_): {Y_full.shape}")
+        else:
+            print("No data paths provided — generating synthetic multi-omics data.")
+            print("(Pass --brca_data, or --gene_expr and --protein_expr for real TCGA-BRCA data.)\n")
+            X_full, Y_full, gene_names, protein_names = simulate_omics_data(
+                n_samples=705, n_genes=604, n_proteins=223,
+                r_true=5, sigma_e2=0.5, sigma_f2=0.5, sigma_h2=0.1,
+                seed=args.seed,
+            )
+            print(f"  Simulated gene expression:    {X_full.shape}")
+            print(f"  Simulated protein expression: {Y_full.shape}")
 
     # ── Run analysis ──────────────────────────────────────────────────────────
     results = run_association_analysis(
