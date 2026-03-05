@@ -23,7 +23,7 @@ import os
 import json
 from datetime import datetime
 
-from ppls_model import PPLSModel, PPLSObjective, PPLSConstraints, NoiseEstimator
+from .ppls_model import PPLSModel, PPLSObjective, PPLSConstraints, NoiseEstimator
 
 
 # ======================================================================

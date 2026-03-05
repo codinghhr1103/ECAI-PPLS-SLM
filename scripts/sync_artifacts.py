@@ -48,7 +48,7 @@ def main() -> int:
     repo_root = Path(__file__).resolve().parents[1]
     artifacts = repo_root / "paper" / "artifacts"
 
-    # --- Simulation / Monte Carlo (main.py) ---
+    # --- Simulation / Monte Carlo (ppls_slm.cli.montecarlo) ---
     out = repo_root / "output"
     sim_dir = artifacts / "simulation"
 

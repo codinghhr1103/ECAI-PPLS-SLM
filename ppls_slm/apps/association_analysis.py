@@ -64,13 +64,13 @@ import pandas as pd
 from scipy import stats
 
 # ── project imports ──────────────────────────────────────────────────────────
-from algorithms import (
+from ppls_slm.algorithms import (
     ECMAlgorithm,
     EMAlgorithm,
     InitialPointGenerator,
     ScalarLikelihoodMethod,
 )
-from ppls_model import PPLSModel
+from ppls_slm.ppls_model import PPLSModel
 
 
 # ─────────────────────────────────────────────────────────────────────────────

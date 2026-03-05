@@ -1,10 +1,10 @@
 """One-click runner for all paper experiments.
 
 Runs (in order):
-  1) Monte Carlo simulation pipeline (main.py)
-  2) Speed experiment (speed_experiment/speed_experiment.py)
-  3) Association application (application/application_association_analysis.py)
-  4) Prediction application (application/application_prediction.py)
+  1) Monte Carlo simulation pipeline (ppls_slm.cli.montecarlo)
+  2) Speed experiment (ppls_slm.benchmarks.speed_experiment)
+  3) Association application (ppls_slm.apps.association_analysis)
+  4) Prediction application (ppls_slm.apps.prediction)
   5) Sync small paper artifacts into paper/artifacts (scripts/sync_artifacts.py)
 
 Usage (from repo root):
@@ -198,8 +198,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     parser.add_argument("--config", type=str, default="config.json", help="Path to config JSON (default: config.json)")
 
     # These flags override config-driven selection
-    parser.add_argument("--skip-montecarlo", action="store_true", help="Skip running main.py")
-    parser.add_argument("--skip-speed", action="store_true", help="Skip speed_experiment")
+    parser.add_argument("--skip-montecarlo", action="store_true", help="Skip Monte Carlo pipeline")
+    parser.add_argument("--skip-speed", action="store_true", help="Skip speed experiment")
     parser.add_argument("--skip-association", action="store_true", help="Skip association application")
     parser.add_argument("--skip-prediction", action="store_true", help="Skip prediction application")
     parser.add_argument("--no-sync", action="store_true", help="Do not run scripts/sync_artifacts.py")
@@ -278,7 +278,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
         # 1) Monte Carlo pipeline
         if run_montecarlo:
-            code = tee_run([sys.executable, "main.py"], cwd=repo_root, log_path=logs_dir / "01_main.log", env=run_env)
+            code = tee_run([sys.executable, "-m", "ppls_slm.cli.montecarlo"], cwd=repo_root, log_path=logs_dir / "01_main.log", env=run_env)
 
             if code != 0:
                 return code
@@ -286,7 +286,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         # 2) Speed experiment
         if run_speed:
             code = tee_run(
-                [sys.executable, "speed_experiment/speed_experiment.py"],
+                [sys.executable, "-m", "ppls_slm.benchmarks.speed_experiment"],
                 cwd=repo_root,
                 log_path=logs_dir / "02_speed_experiment.log",
             )
@@ -295,7 +295,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
         # 3) Association analysis
         if run_association:
-            cmd = [sys.executable, "-m", "application.application_association_analysis", "--output_dir", str(assoc_out), "--plot"]
+            cmd = [sys.executable, "-m", "ppls_slm.apps.association_analysis", "--output_dir", str(assoc_out), "--plot"]
 
             if args.gene_expr and args.protein_expr:
                 cmd += ["--gene_expr", args.gene_expr, "--protein_expr", args.protein_expr]
@@ -309,7 +309,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
         # 4) Prediction
         if run_prediction:
-            cmd = [sys.executable, "-m", "application.application_prediction", "--output_dir", str(pred_out), "--plot"]
+            cmd = [sys.executable, "-m", "ppls_slm.apps.prediction", "--output_dir", str(pred_out), "--plot"]
             code = tee_run(cmd, cwd=repo_root, log_path=logs_dir / "04_prediction.log", env=run_env)
             if code != 0:
                 return code

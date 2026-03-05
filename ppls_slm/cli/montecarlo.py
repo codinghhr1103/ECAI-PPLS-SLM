@@ -47,9 +47,9 @@ import json
 import numpy as np
 from typing import Dict, Optional, Tuple
 
-from data_generator import SineDataGenerator
-from experiment import PPLSExperiment
-from visualization import PPLSVisualizer
+from ppls_slm.data_generator import SineDataGenerator
+from ppls_slm.experiment import PPLSExperiment
+from ppls_slm.visualization import PPLSVisualizer
 
 
 def main():
@@ -320,7 +320,7 @@ def run_data_generation_stage(config: Dict, base_dir: str) -> bool:
             np.random.seed(data_seed)
 
             # Generate data with fixed parameters
-            from ppls_model import PPLSModel
+            from ppls_slm.ppls_model import PPLSModel
             model = PPLSModel(config['model']['p'], config['model']['q'], config['model']['r'])
 
             X, Y = model.sample(

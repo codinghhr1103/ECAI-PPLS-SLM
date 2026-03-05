@@ -39,7 +39,7 @@ import json
 import os
 import pickle
 
-from ppls_model import PPLSModel
+from .ppls_model import PPLSModel
 
 
 class SineDataGenerator:

@@ -215,8 +215,8 @@ def _run_trial_worker(trial_id: int, X: np.ndarray, Y: np.ndarray, seed: int) ->
         return None
 
 
-from algorithms import InitialPointGenerator, ScalarLikelihoodMethod, EMAlgorithm, ECMAlgorithm, NoiseEstimator
-from ppls_model import PPLSModel
+from .algorithms import InitialPointGenerator, ScalarLikelihoodMethod, EMAlgorithm, ECMAlgorithm, NoiseEstimator
+from .ppls_model import PPLSModel
 
 
 class PPLSExperiment:

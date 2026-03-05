@@ -49,8 +49,8 @@ import pandas as pd
 from scipy import stats
 
 # ── project imports ──────────────────────────────────────────────────────────
-from algorithms import InitialPointGenerator, ScalarLikelihoodMethod
-from ppls_model import PPLSModel
+from ppls_slm.algorithms import InitialPointGenerator, ScalarLikelihoodMethod
+from ppls_slm.ppls_model import PPLSModel
 
 
 # ─────────────────────────────────────────────────────────────────────────────

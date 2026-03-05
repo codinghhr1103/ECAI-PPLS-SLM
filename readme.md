@@ -15,8 +15,9 @@ pip install -r requirements.txt
 ## Quick Start
 
 ```python
-from algorithms import ScalarLikelihoodMethod, EMAlgorithm, ECMAlgorithm, InitialPointGenerator
-from data_generator import SineDataGenerator
+from ppls_slm.algorithms import ScalarLikelihoodMethod, EMAlgorithm, ECMAlgorithm, InitialPointGenerator
+from ppls_slm.data_generator import SineDataGenerator
+
 
 # Generate synthetic PPLS data
 generator = SineDataGenerator(p=20, q=20, r=3, n_samples=500)
@@ -43,7 +44,7 @@ ecm_results = ecm.fit(X, Y, starting_points)
 
 ### Full Monte Carlo Experiment
 ```bash
-python main.py
+python -m ppls_slm.cli.montecarlo
 ```
 
 This will execute all three stages:
@@ -90,17 +91,28 @@ Edit `config.json` to modify:
 
 ## File Structure
 
+The repository is organized as a **single library package** (`ppls_slm/`) plus a few utilities.
+
 ```
 PPLS-SLM/
-├── algorithms.py           # SLM, EM, ECM implementations
-├── ppls_model.py          # Core PPLS model and utilities  
-├── data_generator.py      # Synthetic data generation
-├── experiment.py          # Monte Carlo experiment framework
-├── visualization.py       # Results plotting and tables
-├── main.py               # Main execution script
-├── config.json           # Experiment configuration
-├── requirements.txt      # Dependencies
-└── README.md
+├── ppls_slm/                      # library package (implementation)
+│   ├── algorithms.py
+│   ├── ppls_model.py
+│   ├── data_generator.py
+│   ├── experiment.py
+│   ├── visualization.py
+│   ├── cli/
+│   │   └── montecarlo.py          # Monte Carlo pipeline
+│   ├── apps/
+│   │   ├── association_analysis.py
+│   │   └── prediction.py
+│   └── benchmarks/
+│       └── speed_experiment.py
+├── application/                   # datasets (e.g. brca_data_w_subtypes.csv.zip)
+├── scripts/                       # orchestration utilities
+├── config.json
+├── requirements.txt
+└── readme.md
 ```
 
 ## Stage-by-Stage Execution
@@ -124,4 +136,4 @@ Set `force_data_generation: true`, others `false`
 Set `force_parameter_estimation: true`, others `false`
 
 ### Stage 3: Visualization Only
-Set `force_visualization: true`, others `false`
+Set `force_visualization: true`, others `false
