@@ -120,6 +120,25 @@ def _run_trial_worker(trial_id: int, X: np.ndarray, Y: np.ndarray, seed: int) ->
             max_iter=config["algorithms"]["slm"]["max_iter"],
             use_noise_preestimation=config["algorithms"]["slm"]["use_noise_preestimation"],
         )
+
+        # Oracle-noise variant: skip closed-form noise pre-estimation and use true (sigma_e^2, sigma_f^2).
+        slm_oracle = ScalarLikelihoodMethod(
+            p=p,
+            q=q,
+            r=r,
+            optimizer=config["algorithms"]["slm"]["optimizer"],
+            max_iter=config["algorithms"]["slm"]["max_iter"],
+            use_noise_preestimation=False,
+            fixed_sigma_e2=float(true_params.get("sigma_e2")),
+            fixed_sigma_f2=float(true_params.get("sigma_f2")),
+            gtol=config["algorithms"]["slm"].get("gtol", 1e-3),
+            xtol=config["algorithms"]["slm"].get("xtol", 1e-3),
+            barrier_tol=config["algorithms"]["slm"].get("barrier_tol", 1e-3),
+            constraint_slack=config["algorithms"]["slm"].get("constraint_slack", 1e-2),
+        )
+
+
+
         em = EMAlgorithm(
             p=p,
             q=q,
@@ -135,10 +154,15 @@ def _run_trial_worker(trial_id: int, X: np.ndarray, Y: np.ndarray, seed: int) ->
             tolerance=config["algorithms"]["ecm"]["tolerance"],
         )
 
+
         # Run algorithms and collect timing.
         slm_start_time = time.time()
         slm_results = slm.fit(X, Y, starting_points)
         slm_time = time.time() - slm_start_time
+
+        slm_oracle_start_time = time.time()
+        slm_oracle_results = slm_oracle.fit(X, Y, starting_points)
+        slm_oracle_time = time.time() - slm_oracle_start_time
 
         em_start_time = time.time()
         em_results = em.fit(X, Y, starting_points)
@@ -149,8 +173,10 @@ def _run_trial_worker(trial_id: int, X: np.ndarray, Y: np.ndarray, seed: int) ->
         ecm_time = time.time() - ecm_start_time
 
         slm_converged = 1 if slm_results.get("success", False) else 0
+        slm_oracle_converged = 1 if slm_oracle_results.get("success", False) else 0
         em_converged = 1 if em_results.get("log_likelihood", -np.inf) > -np.inf else 0
         ecm_converged = 1 if ecm_results.get("log_likelihood", -np.inf) > -np.inf else 0
+
 
         stats_summary = {
             "trial_id": trial_id,
@@ -159,16 +185,28 @@ def _run_trial_worker(trial_id: int, X: np.ndarray, Y: np.ndarray, seed: int) ->
                 "avg_time_per_start": slm_time / len(starting_points),
                 "converged": slm_converged,
                 "failed": 1 - slm_converged,
-                "convergence_rate": slm_converged / len(starting_points),
+                "convergence_rate": float(slm_converged),
                 "best_objective": slm_results.get("objective_value", np.inf),
                 "avg_iterations": slm_results.get("n_iterations", 0),
+            },
+
+            "slm_oracle": {
+                "runtime": slm_oracle_time,
+                "avg_time_per_start": slm_oracle_time / len(starting_points),
+                "converged": slm_oracle_converged,
+                "failed": 1 - slm_oracle_converged,
+                "convergence_rate": float(slm_oracle_converged),
+
+                "best_objective": slm_oracle_results.get("objective_value", np.inf),
+                "avg_iterations": slm_oracle_results.get("n_iterations", 0),
             },
             "em": {
                 "runtime": em_time,
                 "avg_time_per_start": em_time / len(starting_points),
                 "converged": em_converged,
                 "failed": 1 - em_converged,
-                "convergence_rate": em_converged / len(starting_points),
+                "convergence_rate": float(em_converged),
+
                 "best_likelihood": em_results.get("log_likelihood", -np.inf),
                 "avg_iterations": em_results.get("n_iterations", 0),
             },
@@ -177,11 +215,13 @@ def _run_trial_worker(trial_id: int, X: np.ndarray, Y: np.ndarray, seed: int) ->
                 "avg_time_per_start": ecm_time / len(starting_points),
                 "converged": ecm_converged,
                 "failed": 1 - ecm_converged,
-                "convergence_rate": ecm_converged / len(starting_points),
+                "convergence_rate": float(ecm_converged),
+
                 "best_likelihood": ecm_results.get("log_likelihood", -np.inf),
                 "avg_iterations": ecm_results.get("n_iterations", 0),
             },
         }
+
 
         if save_intermediate:
             stats_file = os.path.join(results_dir, f"trial_{trial_id:03d}_statistics.json")
@@ -192,11 +232,13 @@ def _run_trial_worker(trial_id: int, X: np.ndarray, Y: np.ndarray, seed: int) ->
             "trial_id": trial_id,
             "true_params": true_params,
             "slm_results": slm_results,
+            "slm_oracle_results": slm_oracle_results,
             "em_results": em_results,
             "ecm_results": ecm_results,
             "data_shape": {"X": X.shape, "Y": Y.shape},
             "statistics": stats_summary,
         }
+
 
     except Exception as e:
         # Mirror the sequential behavior: record an error file and return None.
@@ -301,7 +343,8 @@ class PPLSExperiment:
         print(f"Model dimensions: p={self.p}, q={self.q}, r={self.r}")
         print(f"Sample size: {self.n_samples}")
         print(f"Starting points per algorithm: {self.n_starts}")
-        print(f"Algorithms: SLM, EM, ECM")
+        print(f"Algorithms: SLM, SLM-Oracle, EM, ECM")
+
         print(f"Ground truth: Fixed for all trials")
         print(f"{'='*60}\n")
         
@@ -449,7 +492,8 @@ class PPLSExperiment:
     def _run_single_trial(self, trial_id: int, X: np.ndarray, Y: np.ndarray,
                          true_params: Dict, starting_points: List[np.ndarray]) -> Optional[Dict]:
         """
-        Execute one complete trial with all three algorithms.
+        Execute one complete trial with all algorithms (SLM, SLM-Oracle, EM, ECM).
+
         
         Parameters:
         -----------
@@ -480,11 +524,13 @@ class PPLSExperiment:
                 'trial_id': trial_id,
                 'true_params': true_params,
                 'slm_results': comparison_results['slm'],
+                'slm_oracle_results': comparison_results['slm_oracle'],
                 'em_results': comparison_results['em'],
                 'ecm_results': comparison_results['ecm'],
                 'data_shape': {'X': X.shape, 'Y': Y.shape},
                 'statistics': comparison_results.get('statistics', {})
             }
+
             
             return trial_result
             
@@ -531,19 +577,41 @@ class PPLSExperiment:
         results : dict
             Results from all three algorithms
         """
-        # Initialize all three algorithms
+        # Initialize algorithms
         slm = ScalarLikelihoodMethod(
             p=self.p, q=self.q, r=self.r,
             optimizer=self.config['algorithms']['slm']['optimizer'],
             max_iter=self.config['algorithms']['slm']['max_iter'],
-            use_noise_preestimation=self.config['algorithms']['slm']['use_noise_preestimation']
+            use_noise_preestimation=self.config['algorithms']['slm']['use_noise_preestimation'],
+            gtol=self.config['algorithms']['slm'].get('gtol', 1e-3),
+            xtol=self.config['algorithms']['slm'].get('xtol', 1e-3),
+            barrier_tol=self.config['algorithms']['slm'].get('barrier_tol', 1e-3),
+            constraint_slack=self.config['algorithms']['slm'].get('constraint_slack', 1e-2),
         )
+
+
+        # Oracle-noise variant: same optimiser/settings as SLM, but uses true (sigma_e^2, sigma_f^2).
+        slm_oracle = ScalarLikelihoodMethod(
+            p=self.p, q=self.q, r=self.r,
+            optimizer=self.config['algorithms']['slm']['optimizer'],
+            max_iter=self.config['algorithms']['slm']['max_iter'],
+            use_noise_preestimation=False,
+            fixed_sigma_e2=float(true_params.get('sigma_e2')),
+            fixed_sigma_f2=float(true_params.get('sigma_f2')),
+            gtol=self.config['algorithms']['slm'].get('gtol', 1e-3),
+            xtol=self.config['algorithms']['slm'].get('xtol', 1e-3),
+            barrier_tol=self.config['algorithms']['slm'].get('barrier_tol', 1e-3),
+            constraint_slack=self.config['algorithms']['slm'].get('constraint_slack', 1e-2),
+        )
+
+
         
         em = EMAlgorithm(
             p=self.p, q=self.q, r=self.r,
             max_iter=self.config['algorithms']['em']['max_iter'],
             tolerance=self.config['algorithms']['em']['tolerance']
         )
+
         
         ecm = ECMAlgorithm(
             p=self.p, q=self.q, r=self.r,
@@ -564,8 +632,22 @@ class PPLSExperiment:
         slm_time = time.time() - slm_start_time
         
         print(f"SLM completed: {slm_time:.2f}s, convergence: {slm_stats['convergence_rate']*100:.1f}%")
+
+        # Run SLM-Oracle (oracle noise) second
+        print(f"Running SLM-Oracle with {len(starting_points)} starting points...")
+        slm_oracle_start_time = time.time()
+        slm_oracle_results, slm_oracle_stats = self._run_algorithm_with_stats(
+            slm_oracle, X, Y, starting_points, trial_id, "SLM-Oracle"
+        )
+        slm_oracle_time = time.time() - slm_oracle_start_time
+
+        print(
+            f"SLM-Oracle completed: {slm_oracle_time:.2f}s, "
+            f"convergence: {slm_oracle_stats['convergence_rate']*100:.1f}%"
+        )
         
-        # Run EM second
+        # Run EM third
+
         print(f"Running EM with {len(starting_points)} starting points...")
         em_start_time = time.time()
         em_results, em_stats = self._run_algorithm_with_stats(
@@ -599,6 +681,16 @@ class PPLSExperiment:
                 'best_objective': slm_stats['best_objective'],
                 'avg_iterations': slm_stats['avg_iterations']
             },
+            'slm_oracle': {
+                'runtime': slm_oracle_time,
+                'avg_time_per_start': slm_oracle_time/len(starting_points),
+                'converged': slm_oracle_stats['converged'],
+                'failed': slm_oracle_stats['failed'],
+                'convergence_rate': float(slm_oracle_stats['converged']),
+
+                'best_objective': slm_oracle_stats['best_objective'],
+                'avg_iterations': slm_oracle_stats['avg_iterations']
+            },
             'em': {
                 'runtime': em_time,
                 'avg_time_per_start': em_time/len(starting_points),
@@ -613,11 +705,13 @@ class PPLSExperiment:
                 'avg_time_per_start': ecm_time/len(starting_points),
                 'converged': ecm_stats['converged'],
                 'failed': ecm_stats['failed'],
-                'convergence_rate': ecm_stats['converged']/len(starting_points),
+                'convergence_rate': float(ecm_stats['converged']),
+
                 'best_likelihood': ecm_stats['best_likelihood'],
                 'avg_iterations': ecm_stats['avg_iterations']
             }
         }
+
         
         # Save per-trial statistics (optional)
         if self.config.get('output', {}).get('save_intermediate', True):
@@ -628,10 +722,12 @@ class PPLSExperiment:
         
         return {
             'slm': slm_results,
+            'slm_oracle': slm_oracle_results,
             'em': em_results,
             'ecm': ecm_results,
             'statistics': stats_summary
         }
+
         
     def _run_algorithm_with_stats(self, algorithm, X: np.ndarray, Y: np.ndarray,
                                  starting_points: List[np.ndarray],
@@ -663,7 +759,7 @@ class PPLSExperiment:
         results = algorithm.fit(X, Y, starting_points)
         
         # Compile basic statistics
-        if algorithm_name == "SLM":
+        if algorithm_name in ("SLM", "SLM-Oracle"):
             stats = {
                 'converged': 1 if results.get('success', False) else 0,
                 'failed': 0 if results.get('success', False) else 1,
@@ -672,6 +768,7 @@ class PPLSExperiment:
                 'best_objective': results.get('objective_value', np.inf)
             }
         else:  # EM or ECM
+
             stats = {
                 'converged': 1 if results.get('log_likelihood', -np.inf) > -np.inf else 0,
                 'failed': 0 if results.get('log_likelihood', -np.inf) > -np.inf else 1,
@@ -698,13 +795,16 @@ class PPLSExperiment:
         """
         # Initialize metrics calculators
         slm_metrics_list = []
+        slm_oracle_metrics_list = []
         em_metrics_list = []
         ecm_metrics_list = []
         
         # Collect runtime statistics
         slm_runtime_stats = []
+        slm_oracle_runtime_stats = []
         em_runtime_stats = []
         ecm_runtime_stats = []
+
         
         # Collect metrics for each trial
         for trial in trial_results:
@@ -715,6 +815,11 @@ class PPLSExperiment:
             slm_metrics = metrics_calc.compute_mse(trial['slm_results'])
             slm_metrics_list.append(slm_metrics)
             
+            # Compute metrics for SLM-Oracle
+            if 'slm_oracle_results' in trial:
+                slm_oracle_metrics = metrics_calc.compute_mse(trial['slm_oracle_results'])
+                slm_oracle_metrics_list.append(slm_oracle_metrics)
+
             # Compute metrics for EM
             em_metrics = metrics_calc.compute_mse(trial['em_results'])
             em_metrics_list.append(em_metrics)
@@ -726,20 +831,25 @@ class PPLSExperiment:
             # Collect runtime statistics if available
             if 'statistics' in trial:
                 slm_runtime_stats.append(trial['statistics']['slm'])
+                if 'slm_oracle' in trial['statistics']:
+                    slm_oracle_runtime_stats.append(trial['statistics']['slm_oracle'])
                 em_runtime_stats.append(trial['statistics']['em'])
                 ecm_runtime_stats.append(trial['statistics']['ecm'])
+
         
         # Aggregate metrics
         analysis = {
             'slm': self._aggregate_metrics(slm_metrics_list),
+            'slm_oracle': self._aggregate_metrics(slm_oracle_metrics_list),
             'em': self._aggregate_metrics(em_metrics_list),
             'ecm': self._aggregate_metrics(ecm_metrics_list),
             'comparison': self._compare_methods(slm_metrics_list, em_metrics_list, ecm_metrics_list)
         }
+
         
         # Add runtime statistics
         if slm_runtime_stats and em_runtime_stats and ecm_runtime_stats:
-            analysis['runtime_statistics'] = {
+            runtime_statistics = {
                 'slm': self._aggregate_runtime_stats(slm_runtime_stats),
                 'em': self._aggregate_runtime_stats(em_runtime_stats),
                 'ecm': self._aggregate_runtime_stats(ecm_runtime_stats),
@@ -749,6 +859,15 @@ class PPLSExperiment:
                     'total_runtime_ecm': sum(s['runtime'] for s in ecm_runtime_stats)
                 }
             }
+
+            if slm_oracle_runtime_stats:
+                runtime_statistics['slm_oracle'] = self._aggregate_runtime_stats(slm_oracle_runtime_stats)
+                runtime_statistics['overall']['total_runtime_slm_oracle'] = sum(
+                    s['runtime'] for s in slm_oracle_runtime_stats
+                )
+
+            analysis['runtime_statistics'] = runtime_statistics
+
         
         # Generate summary table
         if trial_results:

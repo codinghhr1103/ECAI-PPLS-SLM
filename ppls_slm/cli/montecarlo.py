@@ -182,7 +182,7 @@ def load_configuration(config_path: str) -> Dict:
             },
             'slm': {
                 'optimizer': 'trust-constr',
-                'max_iter': 100,
+                'max_iter': 1000,
                 'use_noise_preestimation': True
             },
             'em': {
@@ -413,7 +413,8 @@ def run_parameter_estimation_stage(config: Dict, base_dir: str) -> bool:
     def _extract_mse_table_from_results(experiment_results: Dict) -> Dict:
         analysis = experiment_results.get('analysis', {})
         params = ['W', 'C', 'B', 'Sigma_t', 'sigma_h2']
-        methods = ['slm', 'em', 'ecm']
+        methods = ['slm', 'slm_oracle', 'em', 'ecm']
+
 
         table = {}
         for method in methods:
@@ -550,6 +551,10 @@ def run_parameter_estimation_stage(config: Dict, base_dir: str) -> bool:
                     'avg_runtime_seconds': round(runtime_stats.get('slm', {}).get('avg_runtime', 0), 2),
                     'avg_convergence_rate_percent': round(runtime_stats.get('slm', {}).get('avg_convergence_rate', 0) * 100, 1)
                 },
+                'slm_oracle': {
+                    'avg_runtime_seconds': round(runtime_stats.get('slm_oracle', {}).get('avg_runtime', 0), 2),
+                    'avg_convergence_rate_percent': round(runtime_stats.get('slm_oracle', {}).get('avg_convergence_rate', 0) * 100, 1)
+                },
                 'em': {
                     'avg_runtime_seconds': round(runtime_stats.get('em', {}).get('avg_runtime', 0), 2),
                     'avg_convergence_rate_percent': round(runtime_stats.get('em', {}).get('avg_convergence_rate', 0) * 100, 1)
@@ -560,9 +565,11 @@ def run_parameter_estimation_stage(config: Dict, base_dir: str) -> bool:
                 }
             }
 
+
         # Add parameter estimation quality
         if 'analysis' in results:
-            for method in ['slm', 'em', 'ecm']:
+            for method in ['slm', 'slm_oracle', 'em', 'ecm']:
+
                 if method in results['analysis']:
                     method_quality = {}
                     for param in ['W', 'C', 'B', 'Sigma_t', 'sigma_h2']:

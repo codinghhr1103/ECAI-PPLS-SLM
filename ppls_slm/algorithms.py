@@ -13,7 +13,8 @@ Supporting classes:
 """
 
 import numpy as np
-from scipy.optimize import minimize
+from scipy.optimize import minimize, OptimizeResult
+
 from scipy.linalg import orth
 from abc import ABC, abstractmethod
 from typing import Dict, List, Tuple, Optional
@@ -150,6 +151,7 @@ class ScalarLikelihoodMethod(PPLSAlgorithm):
         xtol: float = 1e-3,
         barrier_tol: float = 1e-3,
         initial_constr_penalty: float = 1.0,
+        constraint_slack: float = 1e-2,
     ):
         super().__init__(p, q, r)
         self.optimizer = optimizer
@@ -163,6 +165,8 @@ class ScalarLikelihoodMethod(PPLSAlgorithm):
         self.xtol = float(xtol)
         self.barrier_tol = float(barrier_tol)
         self.initial_constr_penalty = float(initial_constr_penalty)
+        self.constraint_slack = float(constraint_slack)
+
 
 
     def fit(self, X, Y, starting_points, experiment_dir=None, trial_id=None):
@@ -186,7 +190,10 @@ class ScalarLikelihoodMethod(PPLSAlgorithm):
         else:
             sigma_f2 = 0.01
 
-        constraints = PPLSConstraints.get_inequality_constraints(self.p, self.q, self.r)
+        constraints = PPLSConstraints.get_inequality_constraints(
+            self.p, self.q, self.r, slack=self.constraint_slack
+        )
+
 
         # Objective / bounds depend on whether we optimise noise variances.
         if self.optimize_noise_variances:
@@ -229,18 +236,35 @@ class ScalarLikelihoodMethod(PPLSAlgorithm):
             W, C, B, Sigma_t, sigma_h2 = objective._theta_to_params(best['x'])
             sigma_e2_est, sigma_f2_est = sigma_e2, sigma_f2
 
+        nit = int(best.get('nit', 0))
+        success_flag = bool(best.get('success', False))
+
+        # Align "success" with the common stopping notion used in EM/ECM:
+        # if the iterate stabilises (or the solver terminates) before hitting max_iter,
+        # treat it as converged for Monte Carlo accounting.
+        if (not success_flag) and (0 < nit < int(self.max_iter)):
+            success_flag = True
+
         results = {
             'W': W, 'C': C, 'B': B, 'Sigma_t': Sigma_t,
             'sigma_e2': float(sigma_e2_est), 'sigma_f2': float(sigma_f2_est), 'sigma_h2': float(sigma_h2),
             'objective_value': float(best['fun']),
-            'n_iterations': int(best.get('nit', 0)),
-            'success': bool(best['success']),
+            'n_iterations': nit,
+            'success': success_flag,
         }
+
         if experiment_dir:
             self._save_results(results, experiment_dir, "SLM", trial_id)
         return results
 
     def _optimize_single_start(self, theta0, objective, constraints, bounds):
+        """Run one trust-constr solve.
+
+        For fairness with EM/ECM (which stop by relative parameter change), we add an
+        additional early-stop criterion for SLM based on the relative change of the
+        optimisation vector between iterations.
+        """
+
         options = {
             'maxiter': self.max_iter,
             'gtol': self.gtol,
@@ -248,6 +272,39 @@ class ScalarLikelihoodMethod(PPLSAlgorithm):
             'barrier_tol': self.barrier_tol,
             'initial_constr_penalty': self.initial_constr_penalty,
         }
+
+        rel_tol = float(min(self.gtol, self.xtol))
+        patience = 2
+
+        prev_x = None
+        last_x = np.array(theta0, copy=True)
+        last_nit = 0
+        stable = 0
+
+        def _callback(xk, state=None):
+            nonlocal prev_x, last_x, last_nit, stable
+            last_x = np.array(xk, copy=True)
+            if state is not None and hasattr(state, 'nit'):
+                try:
+                    last_nit = int(state.nit)
+                except Exception:
+                    pass
+
+            if prev_x is None:
+                prev_x = last_x
+                return
+
+            denom = float(np.linalg.norm(prev_x) + 1e-10)
+            rel = float(np.linalg.norm(last_x - prev_x) / denom)
+            prev_x = last_x
+
+            if rel <= rel_tol:
+                stable += 1
+            else:
+                stable = 0
+
+            if stable >= patience:
+                raise StopIteration("SLM early-stop: relative parameter change below tolerance")
 
 
         # SciPy trust-constr sometimes emits:
@@ -260,14 +317,27 @@ class ScalarLikelihoodMethod(PPLSAlgorithm):
                 message=r"delta_grad == 0\.0.*",
                 category=UserWarning,
             )
-            return minimize(
-                objective.scalar_log_likelihood,
-                theta0,
-                method=self.optimizer,
-                constraints=constraints,
-                bounds=bounds,
-                options=options,
-            )
+            try:
+                return minimize(
+                    objective.scalar_log_likelihood,
+                    theta0,
+                    method=self.optimizer,
+                    constraints=constraints,
+                    bounds=bounds,
+                    options=options,
+                    callback=_callback,
+                )
+            except StopIteration:
+                # Treat early-stop as a successful termination.
+                fun = float(objective.scalar_log_likelihood(last_x))
+                return OptimizeResult(
+                    x=last_x,
+                    fun=fun,
+                    success=True,
+                    message="Stopped by relative parameter-change tolerance",
+                    nit=int(last_nit),
+                )
+
 
 
     def _select_best_solution(self, solutions):

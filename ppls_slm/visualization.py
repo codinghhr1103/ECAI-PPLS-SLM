@@ -119,18 +119,33 @@ class PPLSVisualizer:
         # Extract parameters
         true_params = trial_result['true_params']
         slm_results = trial_result['slm_results']
+        slm_oracle_results = trial_result.get('slm_oracle_results')
         em_results = trial_result['em_results']
         ecm_results = trial_result['ecm_results']
+
+        W_slm_oracle = None
+        C_slm_oracle = None
+        if isinstance(slm_oracle_results, dict) and slm_oracle_results:
+            W_slm_oracle = slm_oracle_results.get('W')
+            C_slm_oracle = slm_oracle_results.get('C')
         
         # Create separate figures for W and C
         fig_W = self.loading_plotter.plot_W_comparison(
-            true_params['W'], slm_results['W'], em_results['W'], ecm_results['W'],
-            component_idx
+            true_params['W'],
+            slm_results['W'],
+            em_results['W'],
+            ecm_results['W'],
+            component_idx,
+            W_slm_oracle=W_slm_oracle,
         )
         
         fig_C = self.loading_plotter.plot_C_comparison(
-            true_params['C'], slm_results['C'], em_results['C'], ecm_results['C'],
-            component_idx
+            true_params['C'],
+            slm_results['C'],
+            em_results['C'],
+            ecm_results['C'],
+            component_idx,
+            C_slm_oracle=C_slm_oracle,
         )
         
         # Save figures with publication-quality naming
@@ -178,21 +193,56 @@ class PPLSVisualizer:
         trial_results : List[Dict]
             Results from all trials
         """
-        # Extract convergence data
-        slm_iterations = []
-        em_iterations = []
-        ecm_iterations = []
-        
+        # Extract convergence data (iterations are summarised over successful trials only).
+        slm_iterations: List[int] = []
+        slm_oracle_iterations: List[int] = []
+        em_iterations: List[int] = []
+        ecm_iterations: List[int] = []
+
+        slm_success: List[int] = []
+        slm_oracle_success: List[int] = []
+        em_success: List[int] = []
+        ecm_success: List[int] = []
+
         for trial in trial_results:
-            if 'slm_results' in trial and 'n_iterations' in trial['slm_results']:
-                slm_iterations.append(trial['slm_results']['n_iterations'])
-            if 'em_results' in trial and 'n_iterations' in trial['em_results']:
-                em_iterations.append(trial['em_results']['n_iterations'])
-            if 'ecm_results' in trial and 'n_iterations' in trial['ecm_results']:
-                ecm_iterations.append(trial['ecm_results']['n_iterations'])
-        
+            slm_res = trial.get('slm_results', {})
+            slm_ok = bool(slm_res.get('success', False))
+            slm_success.append(int(slm_ok))
+            if slm_ok and 'n_iterations' in slm_res:
+                slm_iterations.append(int(slm_res['n_iterations']))
+
+            slm_or_res = trial.get('slm_oracle_results', {})
+            if slm_or_res:
+                slm_or_ok = bool(slm_or_res.get('success', False))
+                slm_oracle_success.append(int(slm_or_ok))
+                if slm_or_ok and 'n_iterations' in slm_or_res:
+                    slm_oracle_iterations.append(int(slm_or_res['n_iterations']))
+
+            em_res = trial.get('em_results', {})
+            em_ok = bool(em_res.get('log_likelihood', -np.inf) > -np.inf)
+            em_success.append(int(em_ok))
+            if em_ok and 'n_iterations' in em_res:
+                em_iterations.append(int(em_res['n_iterations']))
+
+            ecm_res = trial.get('ecm_results', {})
+            ecm_ok = bool(ecm_res.get('log_likelihood', -np.inf) > -np.inf)
+            ecm_success.append(int(ecm_ok))
+            if ecm_ok and 'n_iterations' in ecm_res:
+                ecm_iterations.append(int(ecm_res['n_iterations']))
+
         # Export convergence comparison table to Excel
-        self._export_convergence_table_to_excel(slm_iterations, em_iterations, ecm_iterations)
+        self._export_convergence_table_to_excel(
+            slm_iterations,
+            slm_oracle_iterations,
+            em_iterations,
+            ecm_iterations,
+            success_rates={
+                'SLM': float(np.mean(slm_success)) if slm_success else 0.0,
+                'SLM-Oracle': float(np.mean(slm_oracle_success)) if slm_oracle_success else 0.0,
+                'EM': float(np.mean(em_success)) if em_success else 0.0,
+                'ECM': float(np.mean(ecm_success)) if ecm_success else 0.0,
+            },
+        )
         
     def create_results_summary(self, experiment_results: Dict):
         """
@@ -241,37 +291,64 @@ class PPLSVisualizer:
                 col_idx = df.columns.get_loc(column)
                 worksheet.column_dimensions[chr(65 + col_idx)].width = column_width + 2
                 
-    def _export_convergence_table_to_excel(self, slm_iterations: List, em_iterations: List, 
-                                          ecm_iterations: List):
+    def _export_convergence_table_to_excel(
+        self,
+        slm_iterations: List[int],
+        slm_oracle_iterations: List[int],
+        em_iterations: List[int],
+        ecm_iterations: List[int],
+        *,
+        success_rates: Optional[Dict[str, float]] = None,
+    ):
         """Export convergence comparison table to Excel file."""
+        success_rates = success_rates or {}
+
+        def _sr(name: str) -> float:
+            v = success_rates.get(name, 0.0)
+            try:
+                return float(v)
+            except Exception:
+                return 0.0
+
         # Calculate statistics for convergence comparison
         convergence_data = {
-            'Algorithm': ['SLM', 'EM', 'ECM'],
+            'Algorithm': ['SLM', 'SLM-Oracle', 'EM', 'ECM'],
             'Mean_Iterations': [
                 np.mean(slm_iterations) if slm_iterations else 0,
+                np.mean(slm_oracle_iterations) if slm_oracle_iterations else 0,
                 np.mean(em_iterations) if em_iterations else 0,
                 np.mean(ecm_iterations) if ecm_iterations else 0
             ],
             'Std_Iterations': [
                 np.std(slm_iterations) if slm_iterations else 0,
+                np.std(slm_oracle_iterations) if slm_oracle_iterations else 0,
                 np.std(em_iterations) if em_iterations else 0,
                 np.std(ecm_iterations) if ecm_iterations else 0
             ],
             'Min_Iterations': [
                 np.min(slm_iterations) if slm_iterations else 0,
+                np.min(slm_oracle_iterations) if slm_oracle_iterations else 0,
                 np.min(em_iterations) if em_iterations else 0,
                 np.min(ecm_iterations) if ecm_iterations else 0
             ],
             'Max_Iterations': [
                 np.max(slm_iterations) if slm_iterations else 0,
+                np.max(slm_oracle_iterations) if slm_oracle_iterations else 0,
                 np.max(em_iterations) if em_iterations else 0,
                 np.max(ecm_iterations) if ecm_iterations else 0
             ],
             'Median_Iterations': [
                 np.median(slm_iterations) if slm_iterations else 0,
+                np.median(slm_oracle_iterations) if slm_oracle_iterations else 0,
                 np.median(em_iterations) if em_iterations else 0,
                 np.median(ecm_iterations) if ecm_iterations else 0
-            ]
+            ],
+            'Success_Rate': [
+                _sr('SLM'),
+                _sr('SLM-Oracle'),
+                _sr('EM'),
+                _sr('ECM'),
+            ],
         }
         
         df_convergence = pd.DataFrame(convergence_data)
@@ -368,9 +445,16 @@ class LoadingPlotter:
     Creates sine function comparison plots as shown in Figures 2-3 of the paper.
     """
     
-    def plot_W_comparison(self, W_true: np.ndarray, W_slm: np.ndarray, 
-                          W_em: np.ndarray, W_ecm: np.ndarray,
-                          component_idx: int = 0) -> plt.Figure:
+    def plot_W_comparison(
+        self,
+        W_true: np.ndarray,
+        W_slm: np.ndarray,
+        W_em: np.ndarray,
+        W_ecm: np.ndarray,
+        component_idx: int = 0,
+        *,
+        W_slm_oracle: Optional[np.ndarray] = None,
+    ) -> plt.Figure:
         """
         Create publication-ready comparison plot for W loading matrix.
         
@@ -393,21 +477,42 @@ class LoadingPlotter:
         w_slm = W_slm[:, component_idx]
         w_em = W_em[:, component_idx]
         w_ecm = W_ecm[:, component_idx]
+
+        w_oracle = None
+        if isinstance(W_slm_oracle, np.ndarray) and W_slm_oracle.size > 0:
+            w_oracle = W_slm_oracle[:, component_idx]
         
         # Align signs
-        if np.corrcoef(w_slm, w_true)[0, 1] < 0:
-            w_slm = -w_slm
-        if np.corrcoef(w_em, w_true)[0, 1] < 0:
-            w_em = -w_em
-        if np.corrcoef(w_ecm, w_true)[0, 1] < 0:
-            w_ecm = -w_ecm
+        try:
+            if np.corrcoef(w_slm, w_true)[0, 1] < 0:
+                w_slm = -w_slm
+        except Exception:
+            pass
+        try:
+            if np.corrcoef(w_em, w_true)[0, 1] < 0:
+                w_em = -w_em
+        except Exception:
+            pass
+        try:
+            if np.corrcoef(w_ecm, w_true)[0, 1] < 0:
+                w_ecm = -w_ecm
+        except Exception:
+            pass
+        if w_oracle is not None:
+            try:
+                if np.corrcoef(w_oracle, w_true)[0, 1] < 0:
+                    w_oracle = -w_oracle
+            except Exception:
+                pass
             
         # Plot with publication-quality styling
         x = np.arange(len(w_true))
-        ax.plot(x, w_true, 'k-', linewidth=2.0, label='Ground Truth', zorder=5)
-        ax.plot(x, w_slm, 'g--', linewidth=1.5, label='SLM', alpha=0.8, zorder=4)
-        ax.plot(x, w_em, 'r:', linewidth=1.5, label='EM', alpha=0.8, zorder=3)
-        ax.plot(x, w_ecm, 'b-.', linewidth=1.5, label='ECM', alpha=0.8, zorder=2)
+        ax.plot(x, w_true, 'k-', linewidth=2.0, label='Ground Truth', zorder=6)
+        ax.plot(x, w_slm, 'g--', linewidth=1.5, label='SLM', alpha=0.85, zorder=5)
+        if w_oracle is not None:
+            ax.plot(x, w_oracle, color='m', linestyle='-', linewidth=1.5, label='SLM-Oracle', alpha=0.85, zorder=4)
+        ax.plot(x, w_em, 'r:', linewidth=1.5, label='EM', alpha=0.85, zorder=3)
+        ax.plot(x, w_ecm, 'b-.', linewidth=1.5, label='ECM', alpha=0.85, zorder=2)
         
         ax.set_xlabel('Variable Index', fontweight='bold')
         ax.set_ylabel('Loading Value', fontweight='bold')
@@ -424,9 +529,16 @@ class LoadingPlotter:
         plt.tight_layout()
         return fig
         
-    def plot_C_comparison(self, C_true: np.ndarray, C_slm: np.ndarray, 
-                          C_em: np.ndarray, C_ecm: np.ndarray,
-                          component_idx: int = 0) -> plt.Figure:
+    def plot_C_comparison(
+        self,
+        C_true: np.ndarray,
+        C_slm: np.ndarray,
+        C_em: np.ndarray,
+        C_ecm: np.ndarray,
+        component_idx: int = 0,
+        *,
+        C_slm_oracle: Optional[np.ndarray] = None,
+    ) -> plt.Figure:
         """
         Create publication-ready comparison plot for C loading matrix.
         
@@ -449,21 +561,42 @@ class LoadingPlotter:
         c_slm = C_slm[:, component_idx]
         c_em = C_em[:, component_idx]
         c_ecm = C_ecm[:, component_idx]
+
+        c_oracle = None
+        if isinstance(C_slm_oracle, np.ndarray) and C_slm_oracle.size > 0:
+            c_oracle = C_slm_oracle[:, component_idx]
         
         # Align signs
-        if np.corrcoef(c_slm, c_true)[0, 1] < 0:
-            c_slm = -c_slm
-        if np.corrcoef(c_em, c_true)[0, 1] < 0:
-            c_em = -c_em
-        if np.corrcoef(c_ecm, c_true)[0, 1] < 0:
-            c_ecm = -c_ecm
+        try:
+            if np.corrcoef(c_slm, c_true)[0, 1] < 0:
+                c_slm = -c_slm
+        except Exception:
+            pass
+        try:
+            if np.corrcoef(c_em, c_true)[0, 1] < 0:
+                c_em = -c_em
+        except Exception:
+            pass
+        try:
+            if np.corrcoef(c_ecm, c_true)[0, 1] < 0:
+                c_ecm = -c_ecm
+        except Exception:
+            pass
+        if c_oracle is not None:
+            try:
+                if np.corrcoef(c_oracle, c_true)[0, 1] < 0:
+                    c_oracle = -c_oracle
+            except Exception:
+                pass
             
         # Plot with publication-quality styling
         x = np.arange(len(c_true))
-        ax.plot(x, c_true, 'k-', linewidth=2.0, label='Ground Truth', zorder=5)
-        ax.plot(x, c_slm, 'g--', linewidth=1.5, label='SLM', alpha=0.8, zorder=4)
-        ax.plot(x, c_em, 'r:', linewidth=1.5, label='EM', alpha=0.8, zorder=3)
-        ax.plot(x, c_ecm, 'b-.', linewidth=1.5, label='ECM', alpha=0.8, zorder=2)
+        ax.plot(x, c_true, 'k-', linewidth=2.0, label='Ground Truth', zorder=6)
+        ax.plot(x, c_slm, 'g--', linewidth=1.5, label='SLM', alpha=0.85, zorder=5)
+        if c_oracle is not None:
+            ax.plot(x, c_oracle, color='m', linestyle='-', linewidth=1.5, label='SLM-Oracle', alpha=0.85, zorder=4)
+        ax.plot(x, c_em, 'r:', linewidth=1.5, label='EM', alpha=0.85, zorder=3)
+        ax.plot(x, c_ecm, 'b-.', linewidth=1.5, label='ECM', alpha=0.85, zorder=2)
         
         ax.set_xlabel('Variable Index', fontweight='bold')
         ax.set_ylabel('Loading Value', fontweight='bold')

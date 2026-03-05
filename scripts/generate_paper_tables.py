@@ -87,13 +87,16 @@ def generate_convergence_table(*, artifacts_dir: Path, out_path: Path) -> None:
         "Min_Iterations",
         "Max_Iterations",
         "Median_Iterations",
+        "Success_Rate",
     }
+
     missing = required_cols - set(df.columns)
     if missing:
         raise ValueError(f"Unexpected convergence sheet columns; missing={sorted(missing)}")
 
     # Normalise algorithm names to match paper.
-    order = ["SLM", "EM", "ECM"]
+    order = ["SLM", "SLM-Oracle", "EM", "ECM"]
+
     df = df.copy()
     df["Algorithm"] = df["Algorithm"].astype(str)
 
@@ -103,6 +106,13 @@ def generate_convergence_table(*, artifacts_dir: Path, out_path: Path) -> None:
         if sub.empty:
             raise ValueError(f"Algorithm '{alg}' not found in {xlsx}")
         r = sub.iloc[0]
+        # Success_Rate is stored as a fraction in [0,1].
+        try:
+            succ = float(r["Success_Rate"])
+            succ_s = f"{100.0 * succ:.0f}\\%"
+        except Exception:
+            succ_s = _latex_escape(str(r["Success_Rate"]))
+
         rows.append(
             (
                 alg,
@@ -111,21 +121,36 @@ def generate_convergence_table(*, artifacts_dir: Path, out_path: Path) -> None:
                 _format_int(r["Min_Iterations"]),
                 _format_int(r["Max_Iterations"]),
                 _format_int(r["Median_Iterations"]),
+                succ_s,
             )
         )
+
 
     tex = []
     tex.append(r"\setlength{\tabcolsep}{3pt}")
     tex.append(r"\begin{table}[h]\footnotesize")
     tex.append(r"\centering")
-    tex.append(r"\caption{Convergence statistics across $M=100$ Monte Carlo trials}")
+    # Keep the caption consistent with the actual Monte Carlo trial count (M).
+    m_trials = 100
+    summary = artifacts_dir / "simulation" / "experiment_summary_low.json"
+    if summary.exists():
+        try:
+            m_trials = int(_read_json(summary).get("experiment_info", {}).get("n_trials_completed", 100))
+        except Exception:
+            m_trials = 100
+
+    tex.append(rf"\caption{{Convergence statistics across $M={m_trials}$ Monte Carlo trials}}")
+
     tex.append(r"\label{tab:algorithm_convergence}")
-    tex.append(r"\begin{tabular}{lccccc}")
+    tex.append(r"\begin{tabular}{lcccccc}")
+
     tex.append(r"\toprule")
-    tex.append(r"\textbf{Method} & $\mathbb{E}[I]$ & $\sqrt{\text{Var}[I]}$ & $\min I$ & $\max I$ & $\text{Median}[I]$ \\")
+    tex.append(r"\textbf{Method} & $\mathbb{E}[I]$ & $\sqrt{\text{Var}[I]}$ & $\min I$ & $\max I$ & $\text{Median}[I]$ & Success \\")
+
     tex.append(r"\midrule")
-    for alg, mean, std, mn, mx, med in rows:
-        tex.append(f"{alg}  & {mean}  & {std}  & {mn}  & {mx}  & {med}  \\\\")
+    for alg, mean, std, mn, mx, med, succ in rows:
+
+        tex.append(f"{alg}  & {mean}  & {std}  & {mn}  & {mx}  & {med}  & {succ}  \\\\")
     tex.append(r"\bottomrule")
     tex.append(r"\end{tabular}")
     tex.append(r"\end{table}")
@@ -140,9 +165,11 @@ def generate_parameter_mse_table(*, artifacts_dir: Path, out_path: Path) -> None
 
     methods = [
         ("slm", "SLM"),
+        ("slm_oracle", "SLM-Oracle"),
         ("em", "EM"),
         ("ecm", "ECM"),
     ]
+
     keys = [
         ("W", r"$\text{MSE}_W$"),
         ("C", r"$\text{MSE}_C$"),
