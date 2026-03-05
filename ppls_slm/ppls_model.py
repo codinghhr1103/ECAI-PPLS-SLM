@@ -309,7 +309,13 @@ class NoiseEstimator:
         X_centered = X - np.mean(X, axis=0, keepdims=True)
         Y_centered = Y - np.mean(Y, axis=0, keepdims=True)
 
-        sigma_e2 = np.sum(X_centered ** 2) / N
-        sigma_f2 = np.sum(Y_centered ** 2) / N
+        p = X.shape[1]
+        q = Y.shape[1]
 
-        return max(sigma_e2, 1e-6), max(sigma_f2, 1e-6)
+        # MLE for isotropic noise variance per dimension:
+        #   \hat{\sigma}_e^2 = (1/(N p)) \sum_i ||x_i-\bar{x}||^2
+        #   \hat{\sigma}_f^2 = (1/(N q)) \sum_i ||y_i-\bar{y}||^2
+        sigma_e2 = np.sum(X_centered ** 2) / (N * p)
+        sigma_f2 = np.sum(Y_centered ** 2) / (N * q)
+
+        return max(float(sigma_e2), 1e-6), max(float(sigma_f2), 1e-6)

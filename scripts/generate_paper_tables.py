@@ -125,7 +125,7 @@ def generate_convergence_table(*, artifacts_dir: Path, out_path: Path) -> None:
     tex.append(r"\textbf{Method} & $\mathbb{E}[I]$ & $\sqrt{\text{Var}[I]}$ & $\min I$ & $\max I$ & $\text{Median}[I]$ \\")
     tex.append(r"\midrule")
     for alg, mean, std, mn, mx, med in rows:
-        tex.append(f"{alg}  & {mean}  & {std}  & {mn}  & {mx}  & {med}  \\")
+        tex.append(f"{alg}  & {mean}  & {std}  & {mn}  & {mx}  & {med}  \\\\")
     tex.append(r"\bottomrule")
     tex.append(r"\end{tabular}")
     tex.append(r"\end{table}")
@@ -144,11 +144,11 @@ def generate_parameter_mse_table(*, artifacts_dir: Path, out_path: Path) -> None
         ("ecm", "ECM"),
     ]
     keys = [
-        ("W", r"$\\text{MSE}_W$"),
-        ("C", r"$\\text{MSE}_C$"),
-        ("B", r"$\\text{MSE}_B$"),
-        ("Sigma_t", r"$\\text{MSE}_{\\Sigma_t}$"),
-        ("sigma_h2", r"$\\text{MSE}_{\\sigma_h^2}$"),
+        ("W", r"$\text{MSE}_W$"),
+        ("C", r"$\text{MSE}_C$"),
+        ("B", r"$\text{MSE}_B$"),
+        ("Sigma_t", r"$\text{MSE}_{\Sigma_t}$"),
+        ("sigma_h2", r"$\text{MSE}_{\sigma_h^2}$"),
     ]
 
     def row_for(data: Dict[str, Any], mkey: str) -> Tuple[str, ...]:
@@ -161,11 +161,11 @@ def generate_parameter_mse_table(*, artifacts_dir: Path, out_path: Path) -> None
     tex.append(r"\setlength{\tabcolsep}{2.5pt}")
     tex.append(r"\begin{table}[h]\footnotesize")
     tex.append(r"\centering")
-    tex.append(r"\caption{Parameter estimation accuracy under different noise levels: $\\text{MSE} \\times 10^2$ (mean $\\pm$ standard deviation)}")
+    tex.append(r"\caption{Parameter estimation accuracy under different noise levels: $\text{MSE} \times 10^2$ (mean $\pm$ standard deviation)}")
     tex.append(r"\label{tab:parameter_mse}")
     tex.append(r"\begin{tabular}{llccccc}")
     tex.append(r"\toprule")
-    tex.append(r"\textbf{Noise} & \textbf{Method} & $\\text{MSE}_W$ & $\\text{MSE}_C$ & $\\text{MSE}_B$ & $\\text{MSE}_{\\Sigma_t}$ & $\\text{MSE}_{\\sigma_h^2}$ \\")
+    tex.append(r"\textbf{Noise} & \textbf{Method} & $\text{MSE}_W$ & $\text{MSE}_C$ & $\text{MSE}_B$ & $\text{MSE}_{\Sigma_t}$ & $\text{MSE}_{\sigma_h^2}$ \\")
     tex.append(r"\midrule")
 
     # Low noise block
@@ -222,7 +222,7 @@ def generate_top10_pairs_table(*, artifacts_dir: Path, out_path: Path) -> None:
         prot = _latex_escape(str(r["Protein"]))
         rp = f6(r["rho(P,LV)"])
         ssum = f6(r["sum|rho|"])
-        tex.append(f"{lv} & {gene} & {rg} & {prot} & {rp} & {ssum} \\ ")
+        tex.append(f"{lv} & {gene} & {rg} & {prot} & {rp} & {ssum} \\\\ ")
         tex.append(r"\midrule")
 
     # Replace last \midrule with \bottomrule
@@ -342,11 +342,34 @@ def generate_noise_ablation_exp2_table(*, artifacts_dir: Path, out_path: Path) -
         raise ValueError(f"Unexpected exp2_summary_table columns; missing={sorted(missing)}")
 
     scheme_order = ["A_fixed", "B_joint"]
-    noise_order = ["low", "high"]
 
     # Normalise
     df["noise"] = df["noise"].astype(str)
     df["scheme"] = df["scheme"].astype(str)
+
+    def noise_sort_key(n: str) -> tuple:
+        # Prefer numeric ordering when noise labels encode sigma values, e.g. "e2_0p1".
+        if n.startswith("e2_"):
+            try:
+                return (0, float(n[len("e2_"):].replace("p", ".")))
+            except Exception:
+                pass
+        return (1, n)
+
+    noise_values = df["noise"].unique().tolist()
+    if set(noise_values) == {"low", "high"}:
+        noise_order = ["low", "high"]
+    else:
+        noise_order = sorted(noise_values, key=noise_sort_key)
+
+    def noise_name(n: str) -> str:
+        if n.startswith("e2_"):
+            try:
+                v = float(n[len("e2_"):].replace("p", "."))
+                return f"{v:g}"
+            except Exception:
+                pass
+        return _latex_escape(n.capitalize())
 
     def scheme_name(s: str) -> str:
         # Keep compact labels for the paper.
@@ -383,7 +406,7 @@ def generate_noise_ablation_exp2_table(*, artifacts_dir: Path, out_path: Path) -
             r = sub.iloc[0]
             rows.append(
                 (
-                    n.capitalize(),
+                    noise_name(n),
                     scheme_name(s),
                     fmt_pct(r["success_rate"]),
                     fmt_1dp(r["runtime_sec_mean"]),

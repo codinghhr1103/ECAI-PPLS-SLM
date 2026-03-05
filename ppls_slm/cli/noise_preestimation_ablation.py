@@ -52,6 +52,28 @@ def _set_global_seed(seed: int) -> None:
     np.random.seed(int(seed))
 
 
+def _parse_csv_floats(s: str) -> List[float]:
+    s = (s or "").strip()
+    if not s:
+        return []
+    out: List[float] = []
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        out.append(float(part))
+    return out
+
+
+def _safe_noise_name_from_sigma(sigma: float) -> str:
+    # Used in filenames like exp2_raw_<name>.csv; keep it filesystem-friendly.
+    s = f"{float(sigma):.4f}".rstrip("0").rstrip(".")
+    return f"e2_{s}".replace(".", "p")
+
+
+
+
+
 
 def _generate_params_fixed_loadings(
     p: int,
@@ -325,6 +347,9 @@ def experiment_2_ablation_joint_vs_fixed(
                 optimizer="trust-constr",
                 use_noise_preestimation=True,
                 optimize_noise_variances=False,
+                gtol=gtol,
+                xtol=xtol,
+                barrier_tol=barrier_tol,
             )
             t0 = time.perf_counter()
             res_A = slm_A.fit(X, Y, base_starting_points)
@@ -335,6 +360,8 @@ def experiment_2_ablation_joint_vs_fixed(
             )
 
             # --- Scheme B: joint optimisation (sigma_e2/sigma_f2 included in theta) ---
+            # Empirically, this is much harder than the fixed-variance variant.
+            # A practical baseline is to warm-start joint optimisation from the fixed solution.
             _log(f"[exp2]   B_joint start")
             slm_B = ScalarLikelihoodMethod(
                 p=p,
@@ -349,8 +376,18 @@ def experiment_2_ablation_joint_vs_fixed(
                 barrier_tol=barrier_tol,
             )
 
+            # Warm-start from scheme A (already feasible for W/C constraints).
+            theta0_warm = np.concatenate([
+                res_A["W"].flatten(),
+                res_A["C"].flatten(),
+                np.diag(res_A["Sigma_t"]),
+                np.diag(res_A["B"]),
+                [float(res_A["sigma_h2"]), float(res_A["sigma_e2"]), float(res_A["sigma_f2"])],
+            ])
+            starting_points_B = [theta0_warm] + list(base_starting_points)
+
             t0 = time.perf_counter()
-            res_B = slm_B.fit(X, Y, base_starting_points)
+            res_B = slm_B.fit(X, Y, starting_points_B)
             tB = time.perf_counter() - t0
             _log(
                 f"[exp2]   B_joint done | success={bool(res_B.get('success', False))} | "
@@ -469,13 +506,17 @@ def experiment_2_ablation_joint_vs_fixed(
                 runtime_sec_mean=("runtime_sec", "mean"),
             )
 
+            # Keep x-axis order consistent with the configured noise grid.
+            order = [n.name for n in noise_levels]
+            agg_all["noise"] = pd.Categorical(agg_all["noise"], categories=order, ordered=True)
+
             fig, axes = plt.subplots(1, 2, figsize=(9.0, 3.6))
 
             # success rate
             ax = axes[0]
             for scheme in ["A_fixed", "B_joint"]:
-                sub = agg_all[agg_all["scheme"] == scheme].set_index("noise")
-                xs = list(sub.index)
+                sub = agg_all[agg_all["scheme"] == scheme].sort_values("noise")
+                xs = sub["noise"].astype(str).tolist()
                 ys = sub["success_rate"].values
                 ax.plot(xs, ys, marker="o", label=scheme)
             ax.set_ylim(-0.05, 1.05)
@@ -487,8 +528,8 @@ def experiment_2_ablation_joint_vs_fixed(
             # runtime
             ax = axes[1]
             for scheme in ["A_fixed", "B_joint"]:
-                sub = agg_all[agg_all["scheme"] == scheme].set_index("noise")
-                xs = list(sub.index)
+                sub = agg_all[agg_all["scheme"] == scheme].sort_values("noise")
+                xs = sub["noise"].astype(str).tolist()
                 ys = sub["runtime_sec_mean"].values
                 ax.plot(xs, ys, marker="o", label=scheme)
             ax.set_ylabel("Mean runtime (sec)")
@@ -533,7 +574,9 @@ def main() -> None:
 
     # Experiment-scale knobs (keep defaults close to your spec, but allow overrides)
     parser.add_argument("--exp1_M", type=int, default=50)
-    parser.add_argument("--exp2_M", type=int, default=50)
+    # Prefer fewer reps and more noise levels for Exp2.
+    parser.add_argument("--exp2_M", type=int, default=10)
+
 
 
     parser.add_argument(
@@ -548,8 +591,24 @@ def main() -> None:
     parser.add_argument("--exp2_r", type=int, default=5)
     parser.add_argument("--exp2_N", type=int, default=500)
 
+    # Exp2 noise grid (comma-separated). We vary (sigma_e2, sigma_f2) together, and set sigma_h2=ratio*sigma_e2.
+    parser.add_argument(
+        "--exp2_noise_sigmas",
+        type=str,
+        default="0.1,0.2,0.3,0.4,0.5",
+        help="Comma-separated noise variances for Exp2: sigma_e2=sigma_f2 in each level.",
+    )
+    parser.add_argument(
+        "--exp2_sigma_h2_ratio",
+        type=float,
+        default=0.5,
+        help="Set sigma_h2 = ratio * sigma_e2 for Exp2 noise grid.",
+    )
+
     parser.add_argument("--exp2_n_starts", type=int, default=16)
-    parser.add_argument("--slm_max_iter", type=int, default=100)
+
+    # Exp2 is optimisation-heavy; 100 iterations is almost always too small for trust-constr.
+    parser.add_argument("--slm_max_iter", type=int, default=2000)
 
 
     # Exp2 optimiser knobs
@@ -578,10 +637,13 @@ def main() -> None:
             args.exp2_r = 3
         if args.exp2_N == 500:
             args.exp2_N = 300
+        if args.exp2_noise_sigmas == "0.1,0.2,0.3,0.4,0.5":
+            args.exp2_noise_sigmas = "0.1,0.5"
         if args.exp2_n_starts == 16:
             args.exp2_n_starts = 4
-        if args.slm_max_iter == 100:
-            args.slm_max_iter = 40
+        if args.slm_max_iter == 2000:
+            args.slm_max_iter = 150
+
 
     _log(
         f"[OK] noise ablation runner | run={args.run} | output_dir={os.path.abspath(out_dir)} | "
@@ -610,6 +672,20 @@ def main() -> None:
         )
 
     if args.run in ("all", "exp2"):
+        sigmas = _parse_csv_floats(str(args.exp2_noise_sigmas))
+        if not sigmas:
+            raise ValueError("Exp2 requires at least one noise sigma in --exp2_noise_sigmas")
+
+        noise_levels = [
+            NoiseLevel(
+                _safe_noise_name_from_sigma(s),
+                sigma_e2=float(s),
+                sigma_f2=float(s),
+                sigma_h2=float(args.exp2_sigma_h2_ratio) * float(s),
+            )
+            for s in sigmas
+        ]
+
         experiment_2_ablation_joint_vs_fixed(
             output_dir=out_dir,
             seed=args.seed,
@@ -624,10 +700,7 @@ def main() -> None:
             gtol=float(args.exp2_gtol),
             xtol=float(args.exp2_xtol),
             barrier_tol=float(args.exp2_barrier_tol),
-            noise_levels=[
-                NoiseLevel("low", sigma_e2=0.1, sigma_f2=0.1, sigma_h2=0.05),
-                NoiseLevel("high", sigma_e2=0.5, sigma_f2=0.5, sigma_h2=0.25),
-            ],
+            noise_levels=noise_levels,
         )
 
 
