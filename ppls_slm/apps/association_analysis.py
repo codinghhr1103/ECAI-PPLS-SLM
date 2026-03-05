@@ -222,7 +222,11 @@ def load_brca_data_w_subtypes(path: str) -> Tuple[np.ndarray, np.ndarray, List[s
     X = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-10)
     Y = (Y - Y.mean(axis=0)) / (Y.std(axis=0) + 1e-10)
 
-    return X, Y, rs_cols, pp_cols
+    # Strip the `rs_` / `pp_` prefixes for nicer reporting in tables.
+    gene_names = [str(c)[3:] if str(c).startswith("rs_") else str(c) for c in rs_cols]
+    protein_names = [str(c)[3:] if str(c).startswith("pp_") else str(c) for c in pp_cols]
+
+    return X, Y, gene_names, protein_names
 
 
 def simulate_omics_data(n_samples: int = 705,
@@ -647,16 +651,16 @@ def parse_args():
                         help="CSV path for protein-expression (samples × proteins).")
     parser.add_argument("--brca_data",    type=str, default=None,
                         help="Path to bundled BRCA combined dataset (.csv or .zip).")
-    parser.add_argument("--r",            type=int, default=10,
-                        help="Number of latent variables (default: 10).")
-    parser.add_argument("--n_samples",    type=int, default=100,
-                        help="Number of subsampled samples Ns (default: 100).")
-    parser.add_argument("--n_genes",      type=int, default=100,
-                        help="Number of subsampled genes nGs (default: 100).")
-    parser.add_argument("--n_proteins",   type=int, default=100,
-                        help="Number of subsampled proteins nPs (default: 100).")
-    parser.add_argument("--n_starts",     type=int, default=2,
-                        help="Multi-start initializations (default: 2).")
+    parser.add_argument("--r",            type=int, default=5,
+                        help="Number of latent variables (default: 5).")
+    parser.add_argument("--n_samples",    type=int, default=60,
+                        help="Number of subsampled samples Ns (default: 60).")
+    parser.add_argument("--n_genes",      type=int, default=60,
+                        help="Number of subsampled genes nGs (default: 60).")
+    parser.add_argument("--n_proteins",   type=int, default=60,
+                        help="Number of subsampled proteins nPs (default: 60).")
+    parser.add_argument("--n_starts",     type=int, default=8,
+                        help="Multi-start initializations (default: 8).")
     parser.add_argument("--slm_max_iter", type=int, default=50,
                         help="SLM max iterations (default: 50).")
     parser.add_argument("--em_max_iter",  type=int, default=200,
@@ -684,8 +688,23 @@ def main():
 
     else:
         # Prefer the bundled BRCA dataset if available.
-        default_brca_zip = os.path.join(os.path.dirname(__file__), "brca_data_w_subtypes.csv.zip")
-        brca_path = args.brca_data if args.brca_data is not None else (default_brca_zip if os.path.exists(default_brca_zip) else None)
+        # The paper uses the repo-shipped combined dataset under `application/`.
+        # We resolve it relative to repo root so running from anywhere is safe.
+        from pathlib import Path
+        repo_root = Path(__file__).resolve().parents[2]  # .../ppls_slm
+        repo_root = repo_root.parent                    # repo root
+
+        candidate_brca = []
+        if args.brca_data is not None:
+            candidate_brca.append(Path(args.brca_data))
+
+        # Repo-shipped dataset (paper default)
+        candidate_brca.append(repo_root / "application" / "brca_data_w_subtypes.csv.zip")
+
+        # Legacy location (in case users copied it next to this script)
+        candidate_brca.append(Path(__file__).resolve().parent / "brca_data_w_subtypes.csv.zip")
+
+        brca_path = next((str(p) for p in candidate_brca if p is not None and p.exists()), None)
 
         if brca_path is not None:
             print(f"Loading bundled BRCA combined dataset: {brca_path}")

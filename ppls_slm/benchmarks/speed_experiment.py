@@ -16,7 +16,23 @@ in two equivalent formulations:
 
 All configuration is in the CONFIG dict at the top of the file.
 No command-line arguments are accepted.
+
+Note
+----
+To match the paper's timing protocol, we limit BLAS/OMP threads to 1.
 """
+
+# IMPORTANT: set thread env vars before importing NumPy/BLAS-backed libs.
+import os as _os
+for _k in (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "BLIS_NUM_THREADS",
+):
+    _os.environ.setdefault(_k, "1")
 
 import time
 import numpy as np

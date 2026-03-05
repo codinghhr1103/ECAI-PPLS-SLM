@@ -289,6 +289,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                 [sys.executable, "-m", "ppls_slm.benchmarks.speed_experiment"],
                 cwd=repo_root,
                 log_path=logs_dir / "02_speed_experiment.log",
+                env=run_env,
             )
             if code != 0:
                 return code
