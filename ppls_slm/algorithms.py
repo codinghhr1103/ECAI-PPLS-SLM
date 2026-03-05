@@ -23,7 +23,13 @@ import os
 import json
 from datetime import datetime
 
-from .ppls_model import PPLSModel, PPLSObjective, PPLSConstraints, NoiseEstimator
+from .ppls_model import (
+    PPLSModel,
+    PPLSObjective,
+    PPLSObjectiveWithNoise,
+    PPLSConstraints,
+    NoiseEstimator,
+)
 
 
 # ======================================================================
@@ -119,17 +125,45 @@ class InitialPointGenerator:
 #  SLM
 # ======================================================================
 class ScalarLikelihoodMethod(PPLSAlgorithm):
-    """
-    Scalar Likelihood Method: interior-point optimisation of the
-    scalar-form log-likelihood with per-element orthonormality constraints.
+    """Scalar Likelihood Method (SLM).
+
+    Default mode (paper): pre-estimate (sigma_e^2, sigma_f^2) and keep them fixed during
+    optimisation.
+
+    Ablation mode: optionally include (sigma_e^2, sigma_f^2) in the optimisation vector and
+    jointly optimise them.
     """
 
-    def __init__(self, p, q, r, optimizer='trust-constr', max_iter=100,
-                 use_noise_preestimation=True):
+    def __init__(
+        self,
+        p,
+        q,
+        r,
+        optimizer: str = 'trust-constr',
+        max_iter: int = 100,
+        use_noise_preestimation: bool = True,
+        optimize_noise_variances: bool = False,
+        fixed_sigma_e2: Optional[float] = None,
+        fixed_sigma_f2: Optional[float] = None,
+        # trust-constr tolerances (allow looser settings for fast ablations)
+        gtol: float = 1e-3,
+        xtol: float = 1e-3,
+        barrier_tol: float = 1e-3,
+        initial_constr_penalty: float = 1.0,
+    ):
         super().__init__(p, q, r)
         self.optimizer = optimizer
         self.max_iter = max_iter
         self.use_noise_preestimation = use_noise_preestimation
+        self.optimize_noise_variances = optimize_noise_variances
+        self.fixed_sigma_e2 = fixed_sigma_e2
+        self.fixed_sigma_f2 = fixed_sigma_f2
+
+        self.gtol = float(gtol)
+        self.xtol = float(xtol)
+        self.barrier_tol = float(barrier_tol)
+        self.initial_constr_penalty = float(initial_constr_penalty)
+
 
     def fit(self, X, Y, starting_points, experiment_dir=None, trial_id=None):
         N = X.shape[0]
@@ -137,20 +171,50 @@ class ScalarLikelihoodMethod(PPLSAlgorithm):
         XY_c = XY - XY.mean(axis=0)
         S = (XY_c.T @ XY_c) / N
 
-        if self.use_noise_preestimation:
-            sigma_e2, sigma_f2 = NoiseEstimator.estimate_noise_variances(X, Y)
+        # Decide how to obtain noise variances.
+        if self.fixed_sigma_e2 is not None:
+            sigma_e2 = float(self.fixed_sigma_e2)
+        elif self.use_noise_preestimation:
+            sigma_e2, _ = NoiseEstimator.estimate_noise_variances(X, Y)
         else:
-            sigma_e2, sigma_f2 = 0.01, 0.01
+            sigma_e2 = 0.01
 
-        objective = PPLSObjective(self.p, self.q, self.r, S)
-        objective.sigma_e2 = sigma_e2
-        objective.sigma_f2 = sigma_f2
+        if self.fixed_sigma_f2 is not None:
+            sigma_f2 = float(self.fixed_sigma_f2)
+        elif self.use_noise_preestimation:
+            _, sigma_f2 = NoiseEstimator.estimate_noise_variances(X, Y)
+        else:
+            sigma_f2 = 0.01
 
         constraints = PPLSConstraints.get_inequality_constraints(self.p, self.q, self.r)
-        bounds = PPLSConstraints.get_bounds(self.p, self.q, self.r)
+
+        # Objective / bounds depend on whether we optimise noise variances.
+        if self.optimize_noise_variances:
+            objective = PPLSObjectiveWithNoise(self.p, self.q, self.r, S)
+            bounds = PPLSConstraints.get_bounds_with_noise(self.p, self.q, self.r)
+
+            base_len = self.p * self.r + self.q * self.r + self.r + self.r + 1
+            full_len = base_len + 2
+            starting_points_aug = []
+            for theta0 in starting_points:
+                if len(theta0) == full_len:
+                    starting_points_aug.append(theta0)
+                elif len(theta0) == base_len:
+                    starting_points_aug.append(np.concatenate([theta0, [sigma_e2, sigma_f2]]))
+                else:
+                    raise ValueError(
+                        f"Unexpected starting point length: {len(theta0)} (expected {base_len} or {full_len})"
+                    )
+            starting_points_use = starting_points_aug
+        else:
+            objective = PPLSObjective(self.p, self.q, self.r, S)
+            objective.sigma_e2 = sigma_e2
+            objective.sigma_f2 = sigma_f2
+            bounds = PPLSConstraints.get_bounds(self.p, self.q, self.r)
+            starting_points_use = starting_points
 
         solutions = []
-        for theta0 in starting_points:
+        for theta0 in starting_points_use:
             try:
                 res = self._optimize_single_start(theta0, objective, constraints, bounds)
                 solutions.append(res)
@@ -158,13 +222,19 @@ class ScalarLikelihoodMethod(PPLSAlgorithm):
                 warnings.warn(f"SLM optimisation failed for one start: {e}")
 
         best = self._select_best_solution(solutions)
-        W, C, B, Sigma_t, sigma_h2 = objective._theta_to_params(best['x'])
+
+        if self.optimize_noise_variances:
+            W, C, B, Sigma_t, sigma_h2, sigma_e2_est, sigma_f2_est = objective._theta_to_params(best['x'])
+        else:
+            W, C, B, Sigma_t, sigma_h2 = objective._theta_to_params(best['x'])
+            sigma_e2_est, sigma_f2_est = sigma_e2, sigma_f2
+
         results = {
             'W': W, 'C': C, 'B': B, 'Sigma_t': Sigma_t,
-            'sigma_e2': sigma_e2, 'sigma_f2': sigma_f2, 'sigma_h2': sigma_h2,
-            'objective_value': best['fun'],
-            'n_iterations': best.get('nit', 0),
-            'success': best['success'],
+            'sigma_e2': float(sigma_e2_est), 'sigma_f2': float(sigma_f2_est), 'sigma_h2': float(sigma_h2),
+            'objective_value': float(best['fun']),
+            'n_iterations': int(best.get('nit', 0)),
+            'success': bool(best['success']),
         }
         if experiment_dir:
             self._save_results(results, experiment_dir, "SLM", trial_id)
@@ -172,9 +242,13 @@ class ScalarLikelihoodMethod(PPLSAlgorithm):
 
     def _optimize_single_start(self, theta0, objective, constraints, bounds):
         options = {
-            'maxiter': self.max_iter, 'gtol': 1e-3, 'xtol': 1e-3,
-            'barrier_tol': 1e-3, 'initial_constr_penalty': 1.0,
+            'maxiter': self.max_iter,
+            'gtol': self.gtol,
+            'xtol': self.xtol,
+            'barrier_tol': self.barrier_tol,
+            'initial_constr_penalty': self.initial_constr_penalty,
         }
+
 
         # SciPy trust-constr sometimes emits:
         #   UserWarning: delta_grad == 0.0. Check if the approximated function is linear...

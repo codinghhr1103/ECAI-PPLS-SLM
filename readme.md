@@ -136,4 +136,32 @@ Set `force_data_generation: true`, others `false`
 Set `force_parameter_estimation: true`, others `false`
 
 ### Stage 3: Visualization Only
-Set `force_visualization: true`, others `false
+Set `force_visualization: true`, others `false`
+
+## Paper (LaTeX) tables and artifacts
+
+The LaTeX paper under `paper/` reads figures from `paper/artifacts/` and reads tables from generated `.tex` snippets under `paper/generated/tables/`.
+
+### One-command refresh (recommended)
+
+After you have produced/updated experiment outputs, run:
+
+```bash
+python scripts/sync_artifacts.py
+```
+
+This will:
+1. Copy the latest outputs into `paper/artifacts/`
+2. Generate LaTeX table snippets into `paper/generated/tables/` (via `python scripts/generate_paper_tables.py`)
+
+### Regenerate tables only
+
+If `paper/artifacts/` is already up to date:
+
+```bash
+python scripts/generate_paper_tables.py
+```
+
+### What is auto-generated
+
+The generator produces `.tex` snippets for simulation/association/prediction tables and for noise-ablation tables (Exp1/Exp2/Exp3), so the paper no longer requires manual copy/paste of numbers.

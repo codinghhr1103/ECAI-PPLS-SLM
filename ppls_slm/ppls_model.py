@@ -127,11 +127,13 @@ class PPLSObjective:
     def _compute_ln_det(self, W, C, b, theta_t2, se2, sf2, sh2) -> float:
         """
         ln det(Sigma) = (p-r) ln(se2) + (q-r) ln(sf2) + sum_i ln(D_i)
-        where D_i = (sf2 + sh2)(theta_t2_i + se2) + b_i^2 theta_t2_i sf2
+
+        According to Theorem A (scalar expansion),
+            D_i = (sf2 + sh2)(theta_t2_i + se2) + b_i^2 theta_t2_i se2.
         """
         val = (self.p - self.r) * np.log(se2) + (self.q - self.r) * np.log(sf2)
         for i in range(self.r):
-            D_i = (sf2 + sh2) * (theta_t2[i] + se2) + b[i] ** 2 * theta_t2[i] * sf2
+            D_i = (sf2 + sh2) * (theta_t2[i] + se2) + b[i] ** 2 * theta_t2[i] * se2
             if D_i <= 0:
                 return 1e10
             val += np.log(D_i)
@@ -144,7 +146,7 @@ class PPLSObjective:
         """
         val = np.trace(self.S_xx) / se2 + np.trace(self.S_yy) / sf2
         for i in range(self.r):
-            D_i = (sf2 + sh2) * (theta_t2[i] + se2) + b[i] ** 2 * theta_t2[i] * sf2
+            D_i = (sf2 + sh2) * (theta_t2[i] + se2) + b[i] ** 2 * theta_t2[i] * se2
             if abs(D_i) < 1e-15:
                 return 1e10
             M2 = (sf2 + sh2) * theta_t2[i] / D_i
@@ -173,10 +175,57 @@ class PPLSObjective:
                                np.diag(Sigma_t), np.diag(B), [sigma_h2]])
 
 
+class PPLSObjectiveWithNoise(PPLSObjective):
+    """Ablation variant: jointly optimise (sigma_e^2, sigma_f^2) with other parameters.
+
+    This keeps the same scalar objective, but reads se2/sf2 from the optimisation vector.
+    Layout:
+        [W (p*r), C (q*r), theta_t2 (r), b (r), sigma_h2 (1), sigma_e2 (1), sigma_f2 (1)]
+    """
+
+    def scalar_log_likelihood(self, theta: np.ndarray) -> float:
+        W, C, B, Sigma_t, sigma_h2, se2, sf2 = self._theta_to_params(theta)
+
+        theta_t2 = np.diag(Sigma_t)
+        b = np.diag(B)
+        if np.any(theta_t2 <= 0) or np.any(b <= 0) or sigma_h2 <= 0 or se2 <= 0 or sf2 <= 0:
+            return 1e10
+
+        ln_det = self._compute_ln_det(W, C, b, theta_t2, se2, sf2, sigma_h2)
+        trace = self._compute_trace(W, C, b, theta_t2, se2, sf2, sigma_h2)
+        result = ln_det + trace
+        return result if np.isfinite(result) else 1e10
+
+    def _theta_to_params(self, theta):
+        idx = 0
+        W = theta[idx:idx + self.p * self.r].reshape(self.p, self.r); idx += self.p * self.r
+        C = theta[idx:idx + self.q * self.r].reshape(self.q, self.r); idx += self.q * self.r
+        Sigma_t = np.diag(theta[idx:idx + self.r]); idx += self.r
+        B = np.diag(theta[idx:idx + self.r]); idx += self.r
+        sigma_h2 = float(theta[idx]); idx += 1
+        sigma_e2 = float(theta[idx]); idx += 1
+        sigma_f2 = float(theta[idx]);
+        return W, C, B, Sigma_t, sigma_h2, sigma_e2, sigma_f2
+
+    def _params_to_theta(self, W, C, B, Sigma_t, sigma_h2, sigma_e2, sigma_f2):
+        return np.concatenate([
+            W.flatten(),
+            C.flatten(),
+            np.diag(Sigma_t),
+            np.diag(B),
+            [float(sigma_h2), float(sigma_e2), float(sigma_f2)],
+        ])
+
+
 class PPLSConstraints:
     """
-    Optimisation constraints for PPLS:
+    Optimisation constraints for PPLS.
+
+    Default (paper SLM):
         W'W = I_r,  C'C = I_r,  b_i > 0,  theta_ti^2 > 0,  sigma_h^2 > 0
+
+    Optional ablation variant (joint optimisation):
+        additionally optimise sigma_e^2 > 0, sigma_f^2 > 0.
     """
 
     @staticmethod
@@ -185,6 +234,13 @@ class PPLSConstraints:
         bounds += [(1e-6, None)] * r                   # theta_t^2
         bounds += [(1e-6, None)] * r                   # b
         bounds.append((1e-6, None))                    # sigma_h^2
+        return bounds
+
+    @staticmethod
+    def get_bounds_with_noise(p: int, q: int, r: int) -> list:
+        bounds = PPLSConstraints.get_bounds(p, q, r)
+        bounds.append((1e-6, None))  # sigma_e^2
+        bounds.append((1e-6, None))  # sigma_f^2
         return bounds
 
     @staticmethod
@@ -228,14 +284,12 @@ class PPLSConstraints:
 
 class NoiseEstimator:
     """
-    Closed-form pre-estimation of observation noise variances:
+    Closed-form pre-estimation of observation noise variances (per-dimension):
 
-        sigma_e^2 = (1/N) sum_i ||x_i - x_bar||^2
-        sigma_f^2 = (1/N) sum_i ||y_i - y_bar||^2
+        sigma_e^2 = (1/(N p)) sum_i ||x_i - x_bar||^2
+        sigma_f^2 = (1/(N q)) sum_i ||y_i - y_bar||^2
 
-    These are total-variance estimators that serve as initial estimates for
-    the SLM optimisation.  The theoretical error bound is given by Theorem 5
-    in the paper.
+    These match Eq. (sigma_e_hat) / (sigma_f_hat) in the paper.
     """
 
     @staticmethod

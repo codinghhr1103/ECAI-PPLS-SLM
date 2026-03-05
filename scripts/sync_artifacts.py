@@ -12,7 +12,10 @@ It is safe to re-run; files are overwritten.
 from __future__ import annotations
 
 import shutil
+import subprocess
+import sys
 from pathlib import Path
+
 
 
 def copy_file(src: Path, dst: Path) -> bool:
@@ -96,11 +99,36 @@ def main() -> int:
     copied += int(copy_file(pred_root / "calibration_plot.png", pred_dir / "calibration_plot.png"))
     copied += int(copy_file(pred_root / "prediction_example.png", pred_dir / "prediction_example.png"))
 
+    # --- Noise pre-estimation ablation ---
+    noise_src_candidates = [
+        repo_root / "output" / "noise_ablation",
+        repo_root / "output" / "noise_preestimation_ablation",
+    ]
+    noise_src = next((p for p in noise_src_candidates if p.exists()), None)
+    noise_dir = artifacts / "noise_ablation"
+    if noise_src is None:
+        print(f"[MISS] noise ablation outputs (tried: {', '.join(str(p) for p in noise_src_candidates)})")
+    else:
+        copied += copy_glob(noise_src / "exp1_preestimate_accuracy", "*", noise_dir / "exp1_preestimate_accuracy")
+        copied += copy_glob(noise_src / "exp2_joint_vs_fixed", "*", noise_dir / "exp2_joint_vs_fixed")
+        copied += copy_glob(noise_src / "exp3_error_propagation", "*", noise_dir / "exp3_error_propagation")
+
+    # Also generate LaTeX tables from the synced artifacts so the paper stays consistent.
+    gen_tables = repo_root / "scripts" / "generate_paper_tables.py"
+    if gen_tables.exists():
+        try:
+            subprocess.check_call([sys.executable, str(gen_tables)], cwd=str(repo_root))
+        except Exception as e:
+            print(f"[WARN] table generation failed: {e}")
+    else:
+        print(f"[WARN] missing generator script: {gen_tables}")
+
     print("\n" + "=" * 72)
     print(f"Done. Copied {copied} file(s) into {artifacts}")
     print("=" * 72)
 
     return 0
+
 
 
 if __name__ == "__main__":
