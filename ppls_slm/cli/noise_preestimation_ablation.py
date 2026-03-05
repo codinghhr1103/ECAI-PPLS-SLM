@@ -1,10 +1,10 @@
 """Noise-preestimation ablation experiments.
 
-Implements three experiments requested in the paper-ablation discussion:
+Implements two experiments requested in the paper-ablation discussion:
 
 1) Pre-estimation accuracy validation across SNR and N, with Theorem bound overlay.
 2) Ablation: pre-estimate+fix vs joint optimisation of (sigma_e^2, sigma_f^2).
-3) Error propagation: sensitivity of parameter MSE to biased sigma_e^2 input.
+
 
 Run:
   python -m ppls_slm.cli.noise_preestimation_ablation --output_dir results_noise_ablation
@@ -521,188 +521,20 @@ def experiment_2_ablation_joint_vs_fixed(
 
 
 
-def experiment_3_error_propagation(
-    *,
-    output_dir: str,
-    seed: int,
-    M: int,
-    p: int,
-    q: int,
-    r: int,
-    N: int,
-    deltas: List[float],
-    sigma_t_diag: float,
-    sigma_e2_true: float,
-    sigma_f2_true: float,
-    sigma_h2_true: float,
-    n_starts: int,
-    slm_max_iter: int,
-) -> None:
-    out_dir = _ensure_dir(os.path.join(output_dir, "exp3_error_propagation"))
 
-    _log(
-        f"[exp3] start | p=q={p}, r={r}, N={N}, M={M}, n_starts={n_starts}, slm_max_iter={slm_max_iter}"
-    )
-
-    noise = NoiseLevel("true", sigma_e2=sigma_e2_true, sigma_f2=sigma_f2_true, sigma_h2=sigma_h2_true)
-    params_true = _generate_params_fixed_loadings(p, q, r, sigma_t_diag=sigma_t_diag, noise=noise, seed=seed)
-
-    init_gen = InitialPointGenerator(p=p, q=q, r=r, n_starts=n_starts, random_seed=seed)
-    starting_points = init_gen.generate_starting_points()
-
-    rows: List[Dict] = []
-    csv_path = os.path.join(out_dir, "exp3_error_propagation.csv")
-
-    # Resume support
-    done_pairs = set()
-    if os.path.exists(csv_path):
-        try:
-            existing = pd.read_csv(csv_path)
-            for _, rr in existing[["delta", "rep"]].dropna().iterrows():
-                done_pairs.add((float(rr["delta"]), int(rr["rep"])))
-            rows.extend(existing.to_dict("records"))
-            _log(f"[exp3] resume detected: {csv_path} (existing_rows={len(rows)})")
-        except Exception:
-            pass
-
-    rep_times: List[float] = []
-    total_jobs = len(deltas) * M
-    done_jobs = 0
-
-    for delta in deltas:
-        sigma_e2_input = sigma_e2_true * (1.0 + float(delta))
-        sigma_e2_input = max(float(sigma_e2_input), 1e-6)
-
-        _log(f"[exp3] delta={delta:+.2f} start")
-
-        for m in range(M):
-            if (float(delta), int(m)) in done_pairs:
-                done_jobs += 1
-                continue
-
-            _log(f"[exp3]   rep {m+1}/{M} start")
-
-            rng = np.random.default_rng(seed + 3333 + int(1000 * (delta + 1.7)) + 17 * m)
-            X, Y, _ = _sample_ppls(params_true, n_samples=N, rng=rng)
-
-            slm = ScalarLikelihoodMethod(
-                p=p,
-                q=q,
-                r=r,
-                max_iter=slm_max_iter,
-                optimizer="trust-constr",
-                use_noise_preestimation=False,
-                optimize_noise_variances=False,
-                fixed_sigma_e2=sigma_e2_input,
-                fixed_sigma_f2=sigma_f2_true,
-            )
-
-            t0 = time.perf_counter()
-            res = slm.fit(X, Y, starting_points)
-            runtime = time.perf_counter() - t0
-
-            # only track required MSEs
-            W, C, B = _align_signs(res["W"], res["C"], res["B"], params_true["W"], params_true["C"])
-            mse_W = float(np.mean((W - params_true["W"]) ** 2))
-            mse_C = float(np.mean((C - params_true["C"]) ** 2))
-            mse_B = float(np.mean((np.diag(B) - np.diag(params_true["B"])) ** 2))
-
-            rows.append({
-                "delta": float(delta),
-                "sigma_e2_input": float(sigma_e2_input),
-                "rep": m,
-                "success": int(bool(res.get("success", False))),
-                "n_iterations": int(res.get("n_iterations", 0)),
-                "runtime_sec": float(runtime),
-                "mse_W": mse_W,
-                "mse_C": mse_C,
-                "mse_B": mse_B,
-            })
-
-            done_jobs += 1
-            rep_times.append(float(runtime))
-            mean_job = float(np.mean(rep_times)) if rep_times else float('nan')
-            remaining = total_jobs - done_jobs
-            eta_min = (mean_job * remaining) / 60.0 if np.isfinite(mean_job) else float('nan')
-
-            _log(
-                f"[exp3]   rep {m+1}/{M} done | success={bool(res.get('success', False))} | "
-                f"iters={int(res.get('n_iterations', 0))} | {runtime:.1f}s | ETA~{eta_min:.1f} min"
-            )
-
-            # incremental save
-            if done_jobs % 5 == 0:
-                try:
-                    pd.DataFrame(rows).to_csv(csv_path, index=False)
-                except Exception:
-                    pass
-
-        _log(f"[exp3] delta={delta:+.2f} done")
-
-    pd.DataFrame(rows).to_csv(csv_path, index=False)
-
-
-    df = pd.DataFrame(rows)
-
-    # aggregate + plot
-    # Aggregate over all runs (and keep success_rate separately). This avoids an empty
-    # curve when the optimizer does not report convergence.
-    agg = (
-        df.groupby("delta", as_index=False)
-        .agg(
-            mse_W_mean=("mse_W", "mean"),
-            mse_C_mean=("mse_C", "mean"),
-            mse_B_mean=("mse_B", "mean"),
-            success_rate=("success", "mean"),
-        )
-        .sort_values("delta")
-    )
-    agg.to_csv(os.path.join(out_dir, "exp3_aggregated.csv"), index=False)
-
-
-    fig, ax = plt.subplots(figsize=(6.2, 4.2))
-    ax.plot(agg["delta"], agg["mse_W_mean"], marker="o", label="MSE(W)")
-    ax.plot(agg["delta"], agg["mse_C_mean"], marker="o", label="MSE(C)")
-    ax.plot(agg["delta"], agg["mse_B_mean"], marker="o", label="MSE(B)")
-
-    ax.set_xlabel(r"Bias $\delta$ in $\sigma_e^2$ input")
-    ax.set_ylabel("MSE")
-    ax.set_title(r"Error propagation vs biased $\sigma_e^2$ input")
-    ax.grid(True, alpha=0.25)
-    ax.legend()
-
-    fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "exp3_error_propagation.png"), dpi=300)
-    plt.close(fig)
-
-    with open(os.path.join(out_dir, "exp3_config.json"), "w", encoding="utf-8") as f:
-        json.dump({
-            "seed": seed,
-            "M": M,
-            "p": p,
-            "q": q,
-            "r": r,
-            "N": N,
-            "deltas": deltas,
-            "sigma_t_diag": sigma_t_diag,
-            "sigma_e2_true": sigma_e2_true,
-            "sigma_f2_true": sigma_f2_true,
-            "sigma_h2_true": sigma_h2_true,
-            "n_starts": n_starts,
-            "slm_max_iter": slm_max_iter,
-        }, f, indent=2)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Noise pre-estimation ablation experiments")
     parser.add_argument("--output_dir", type=str, default="results_noise_ablation")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--run", type=str, default="all", choices=["all", "exp1", "exp2", "exp3"])
+    parser.add_argument("--run", type=str, default="all", choices=["all", "exp1", "exp2"])
+
 
     # Experiment-scale knobs (keep defaults close to your spec, but allow overrides)
     parser.add_argument("--exp1_M", type=int, default=50)
     parser.add_argument("--exp2_M", type=int, default=50)
-    parser.add_argument("--exp3_M", type=int, default=30)
+
 
     parser.add_argument(
         "--fast",
@@ -717,8 +549,8 @@ def main() -> None:
     parser.add_argument("--exp2_N", type=int, default=500)
 
     parser.add_argument("--exp2_n_starts", type=int, default=16)
-    parser.add_argument("--exp3_n_starts", type=int, default=16)
     parser.add_argument("--slm_max_iter", type=int, default=100)
+
 
     # Exp2 optimiser knobs
     parser.add_argument("--exp2_optimizer", type=str, default="trust-constr")
@@ -799,25 +631,10 @@ def main() -> None:
         )
 
 
-    if args.run in ("all", "exp3"):
-        experiment_3_error_propagation(
-            output_dir=out_dir,
-            seed=args.seed,
-            M=int(args.exp3_M),
-            p=100,
-            q=100,
-            r=5,
-            N=500,
-            deltas=[-0.5, -0.3, -0.1, 0.0, 0.1, 0.3, 0.5, 1.0],
-            sigma_t_diag=1.0,
-            sigma_e2_true=0.1,
-            sigma_f2_true=0.1,
-            sigma_h2_true=0.05,
-            n_starts=int(args.exp3_n_starts),
-            slm_max_iter=int(args.slm_max_iter),
-        )
+
 
     print(f"[OK] Done. Outputs written to: {os.path.abspath(out_dir)}")
+
 
 
 if __name__ == "__main__":

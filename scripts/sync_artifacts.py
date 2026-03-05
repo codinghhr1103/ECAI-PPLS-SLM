@@ -111,7 +111,7 @@ def main() -> int:
     else:
         copied += copy_glob(noise_src / "exp1_preestimate_accuracy", "*", noise_dir / "exp1_preestimate_accuracy")
         copied += copy_glob(noise_src / "exp2_joint_vs_fixed", "*", noise_dir / "exp2_joint_vs_fixed")
-        copied += copy_glob(noise_src / "exp3_error_propagation", "*", noise_dir / "exp3_error_propagation")
+
 
     # Also generate LaTeX tables from the synced artifacts so the paper stays consistent.
     gen_tables = repo_root / "scripts" / "generate_paper_tables.py"

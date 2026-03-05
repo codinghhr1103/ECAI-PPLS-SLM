@@ -375,7 +375,6 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             seed = int(original_config.get("experiment", {}).get("random_seed", 42))
 
             exp2_n_starts = int(noise_cfg.get("exp2_n_starts", n_starts_default))
-            exp3_n_starts = int(noise_cfg.get("exp3_n_starts", n_starts_default))
             slm_max_iter = int(noise_cfg.get("slm_max_iter", slm_max_iter_default))
 
             cmd = [
@@ -390,8 +389,6 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                 str(seed),
                 "--exp2_n_starts",
                 str(exp2_n_starts),
-                "--exp3_n_starts",
-                str(exp3_n_starts),
                 "--slm_max_iter",
                 str(slm_max_iter),
             ]
@@ -401,13 +398,11 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             # This is useful because exp2 (joint optimisation) can be very slow.
             exp1_M = noise_cfg.get("exp1_M")
             exp2_M = noise_cfg.get("exp2_M")
-            exp3_M = noise_cfg.get("exp3_M")
             if exp1_M is not None:
                 cmd += ["--exp1_M", str(int(exp1_M))]
             if exp2_M is not None:
                 cmd += ["--exp2_M", str(int(exp2_M))]
-            if exp3_M is not None:
-                cmd += ["--exp3_M", str(int(exp3_M))]
+
 
             if bool(noise_cfg.get("fast", False)):
                 cmd += ["--fast"]

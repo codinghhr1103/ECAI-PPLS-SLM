@@ -482,104 +482,6 @@ def generate_noise_ablation_exp1_table(*, artifacts_dir: Path, out_path: Path) -
     out_path.write_text("\n".join(tex), encoding="utf-8")
 
 
-def generate_noise_ablation_exp3_table(*, artifacts_dir: Path, out_path: Path) -> None:
-    """Noise ablation Exp3: error propagation summary.
-
-    Primary source: `paper/artifacts/noise_ablation/exp3_error_propagation/exp3_aggregated.csv`
-    Fallback source: `paper/artifacts/noise_ablation/exp3_error_propagation/exp3_error_propagation.csv`
-
-    Some synced artifacts may miss/empty the aggregated CSV; in that case we recompute it.
-    """
-
-    agg_path = artifacts_dir / "noise_ablation" / "exp3_error_propagation" / "exp3_aggregated.csv"
-    raw_path = artifacts_dir / "noise_ablation" / "exp3_error_propagation" / "exp3_error_propagation.csv"
-
-    df_agg: pd.DataFrame
-    if agg_path.exists():
-        try:
-            df_agg = pd.read_csv(agg_path)
-        except Exception:
-            df_agg = pd.DataFrame()
-    else:
-        df_agg = pd.DataFrame()
-
-    if df_agg.empty:
-        # If the aggregated CSV is missing or empty, recompute it from the raw runs.
-        # We aggregate MSE over *all* runs so the curve/table remains meaningful even
-        # when the optimizer does not report convergence.
-        df_raw = pd.read_csv(raw_path)
-        need = {"delta", "success", "mse_W", "mse_C", "mse_B"}
-        missing = need - set(df_raw.columns)
-        if missing:
-            raise ValueError(f"Unexpected exp3_error_propagation columns; missing={sorted(missing)}")
-
-        df_raw = df_raw.copy()
-        df_raw["delta"] = df_raw["delta"].astype(float)
-        df_raw["success"] = df_raw["success"].astype(int)
-
-        df_agg = (
-            df_raw.groupby("delta", as_index=False)
-            .agg(
-                success_rate=("success", "mean"),
-                mse_W_mean=("mse_W", "mean"),
-                mse_C_mean=("mse_C", "mean"),
-                mse_B_mean=("mse_B", "mean"),
-            )
-            .sort_values("delta")
-        )
-
-
-    need_agg = {"delta", "success_rate", "mse_W_mean", "mse_C_mean", "mse_B_mean"}
-    missing_agg = need_agg - set(df_agg.columns)
-    if missing_agg:
-        raise ValueError(f"Unexpected exp3 aggregated columns; missing={sorted(missing_agg)}")
-
-    def fmt_delta(x: Any) -> str:
-        try:
-            xf = float(x)
-        except Exception:
-            return _latex_escape(str(x))
-        return f"{xf:.1f}"
-
-    def fmt_pct_0dp(x: Any) -> str:
-        try:
-            xf = float(x)
-        except Exception:
-            return "--"
-        if pd.isna(xf):
-            return "--"
-        return f"{100.0 * xf:.0f}\\%"
-
-    def fmt_mse(x: Any) -> str:
-        try:
-            xf = float(x)
-        except Exception:
-            return "--"
-        if pd.isna(xf):
-            return "--"
-        # Use 3 significant digits; MSE magnitudes can vary.
-        return f"{xf:.3g}"
-
-    tex: list[str] = []
-    tex.append(r"\begin{table}[t]\small")
-    tex.append(r"\centering")
-    tex.append(r"\caption{Error propagation (Exp3): success rate and parameter-estimation MSE under a multiplicative bias $\delta$ applied to the input $\sigma_e^2$.}")
-    tex.append(r"\label{tab:noise_ablation_exp3}")
-    tex.append(r"\begin{tabular}{lcccc}")
-    tex.append(r"\toprule")
-    tex.append(r"$\delta$ & Success & MSE($W$) & MSE($C$) & MSE($B$) \\")
-    tex.append(r"\midrule")
-
-    for _, r in df_agg.sort_values("delta").iterrows():
-        tex.append(
-            f"{fmt_delta(r['delta'])} & {fmt_pct_0dp(r['success_rate'])} & {fmt_mse(r['mse_W_mean'])} & {fmt_mse(r['mse_C_mean'])} & {fmt_mse(r['mse_B_mean'])} \\\\")
-
-    tex.append(r"\bottomrule")
-    tex.append(r"\end{tabular}")
-    tex.append(r"\end{table}")
-    tex.append("")
-
-    out_path.write_text("\n".join(tex), encoding="utf-8")
 
 
 def generate_paper_metrics(*, artifacts_dir: Path, out_path: Path) -> None:
@@ -728,7 +630,7 @@ def main() -> None:
 
     generate_noise_ablation_exp1_table(artifacts_dir=artifacts_dir, out_path=out_dir / "tab_noise_ablation_exp1.tex")
     generate_noise_ablation_exp2_table(artifacts_dir=artifacts_dir, out_path=out_dir / "tab_noise_ablation_exp2.tex")
-    generate_noise_ablation_exp3_table(artifacts_dir=artifacts_dir, out_path=out_dir / "tab_noise_ablation_exp3.tex")
+
 
     generate_paper_metrics(artifacts_dir=artifacts_dir, out_path=paper_dir / "generated" / "metrics.tex")
 

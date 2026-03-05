@@ -164,4 +164,5 @@ python scripts/generate_paper_tables.py
 
 ### What is auto-generated
 
-The generator produces `.tex` snippets for simulation/association/prediction tables and for noise-ablation tables (Exp1/Exp2/Exp3), so the paper no longer requires manual copy/paste of numbers.
+The generator produces `.tex` snippets for simulation/association/prediction tables and for noise-ablation tables (Exp1/Exp2), so the paper no longer requires manual copy/paste of numbers.
+
