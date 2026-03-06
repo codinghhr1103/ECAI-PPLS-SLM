@@ -373,40 +373,15 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             if code != 0:
                 return code
 
-        # 4) Prediction
+        # 4) Prediction (synthetic)
         if run_prediction:
-            cmd = [sys.executable, "-u", "-m", "ppls_slm.apps.prediction", "--output_dir", str(pred_out)]
-
-            # Optional config-driven knobs (defaults are defined in the app).
-            if bool(pred_cfg.get("plot", True)):
-                cmd += ["--plot"]
-
-            if bool(pred_cfg.get("no_baselines", False)):
-                cmd += ["--no_baselines"]
-
-
-            for k in (
-                "p",
-                "q",
-                "r",
-                "n_samples",
-                "n_folds",
-                "n_starts",
-                "seed",
-                "sigma_e2",
-                "sigma_f2",
-                "sigma_h2",
-                "slm_max_iter",
-                "em_max_iter",
-                "em_tol",
-            ):
-
-                if k in pred_cfg and pred_cfg.get(k) is not None:
-                    cmd += [f"--{k}", str(pred_cfg.get(k))]
+            # Prediction app reads *all* hyperparameters from config.
+            cmd = [sys.executable, "-u", "-m", "ppls_slm.apps.prediction", "--config", str(config_path)]
 
             code = tee_run(cmd, cwd=repo_root, log_path=logs_dir / "04_prediction.log", env=run_env)
             if code != 0:
                 return code
+
 
 
 
@@ -444,25 +419,12 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
         # 6) BRCA calibration benchmark (optional)
         if run_brca_calibration:
-            brca_pred_cfg = exp_cfg.get("prediction_brca", {})
-            brca_out = brca_pred_cfg.get("output_dir", "results_prediction_brca")
-
-            cmd = [sys.executable, "-u", "-m", "ppls_slm.apps.brca_calibration", "--output_dir", str(brca_out)]
-
-            brca_data_path = brca_pred_cfg.get("brca_data") or brca_data
-            if brca_data_path:
-                cmd += ["--brca_data", str(brca_data_path)]
-
-            # Point to the summary written by the prediction benchmark.
-            cmd += ["--prediction_summary", str(Path(brca_out) / "brca_prediction_summary.csv")]
-
-            for k in ("seed", "n_folds", "slm_n_starts", "slm_max_iter"):
-                if k in brca_pred_cfg and brca_pred_cfg.get(k) is not None:
-                    cmd += [f"--{k}", str(brca_pred_cfg.get(k))]
+            cmd = [sys.executable, "-u", "-m", "ppls_slm.apps.brca_calibration", "--config", str(config_path)]
 
             code = tee_run(cmd, cwd=repo_root, log_path=logs_dir / "06_brca_calibration.log", env=run_env)
             if code != 0:
                 return code
+
 
         # 7) Sync artifacts
         if run_sync:

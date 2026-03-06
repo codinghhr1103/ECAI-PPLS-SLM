@@ -248,59 +248,90 @@ def _select_best_r(df_by_r: pd.DataFrame) -> pd.DataFrame:
 
 def parse_args():
     p = argparse.ArgumentParser(description="BRCA prediction benchmark (5-fold CV)")
-    p.add_argument("--brca_data", type=str, default="application/brca_data_w_subtypes.csv.zip")
-    p.add_argument("--output_dir", type=str, default="results_prediction_brca")
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--n_folds", type=int, default=5)
-    p.add_argument("--r_grid", type=str, default="3,5,8,10")
-
-    p.add_argument("--slm_n_starts", type=int, default=8)
-    p.add_argument("--slm_max_iter", type=int, default=50)
-
-    p.add_argument("--em_n_starts", type=int, default=8)
-    p.add_argument("--em_max_iter", type=int, default=200)
-    p.add_argument("--em_tol", type=float, default=1e-4)
-
+    p.add_argument("--config", type=str, required=True, help="Path to config JSON (single source of truth)")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-    os.makedirs(args.output_dir, exist_ok=True)
 
-    r_grid = [int(x.strip()) for x in str(args.r_grid).split(",") if x.strip()]
+    from ppls_slm.experiment_config import (
+        coerce_bool,
+        coerce_float,
+        coerce_int,
+        get_experiment_cfg,
+        load_config,
+        require_keys,
+    )
 
-    X, Y = load_brca_combined_raw(args.brca_data)
+    cfg = load_config(args.config)
+    brca_cfg = get_experiment_cfg(cfg, "prediction_brca")
+
+    require_keys(
+        brca_cfg,
+        [
+            "thread_limit",
+            "brca_data",
+            "output_dir",
+            "seed",
+            "n_folds",
+            "r_grid",
+            "n_starts",
+            "max_iter",
+            "em_tol",
+        ],
+        ctx="experiments.prediction_brca",
+    )
+
+    for k in ("thread_limit", "seed", "n_folds", "n_starts", "max_iter"):
+        coerce_int(brca_cfg, k, ctx="experiments.prediction_brca")
+    coerce_float(brca_cfg, "em_tol", ctx="experiments.prediction_brca")
+
+    output_dir = str(brca_cfg["output_dir"])
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Runtime thread limiting (helps avoid BLAS thread deadlocks / oversubscription on Windows).
+    try:
+        from threadpoolctl import threadpool_limits
+
+        threadpool_limits(limits=int(brca_cfg["thread_limit"]))
+    except Exception:
+        pass
+
+    r_grid = [int(x.strip()) for x in str(brca_cfg["r_grid"]).split(",") if x.strip()]
+
+    X, Y = load_brca_combined_raw(str(brca_cfg["brca_data"]))
     print(f"Loaded BRCA: X={X.shape}, Y={Y.shape}")
 
     df = run_brca_prediction(
         X,
         Y,
         r_grid=r_grid,
-        n_folds=args.n_folds,
-        seed=args.seed,
-        slm_n_starts=args.slm_n_starts,
-        slm_max_iter=args.slm_max_iter,
-        em_n_starts=args.em_n_starts,
-        em_max_iter=args.em_max_iter,
-        em_tol=args.em_tol,
+        n_folds=int(brca_cfg["n_folds"]),
+        seed=int(brca_cfg["seed"]),
+        slm_n_starts=int(brca_cfg["n_starts"]),
+        slm_max_iter=int(brca_cfg["max_iter"]),
+        em_n_starts=int(brca_cfg["n_starts"]),
+        em_max_iter=int(brca_cfg["max_iter"]),
+        em_tol=float(brca_cfg["em_tol"]),
     )
 
-    df.to_csv(os.path.join(args.output_dir, "brca_prediction_per_fold.csv"), index=False)
+    df.to_csv(os.path.join(output_dir, "brca_prediction_per_fold.csv"), index=False)
 
     df_by_r = _aggregate_by_r(df)
-    df_by_r.to_csv(os.path.join(args.output_dir, "brca_prediction_by_r.csv"), index=False)
+    df_by_r.to_csv(os.path.join(output_dir, "brca_prediction_by_r.csv"), index=False)
 
     df_best = _select_best_r(df_by_r)
-    df_best.to_csv(os.path.join(args.output_dir, "brca_prediction_summary.csv"), index=False)
+    df_best.to_csv(os.path.join(output_dir, "brca_prediction_summary.csv"), index=False)
 
     print("\nSaved:")
-    print(f"  {args.output_dir}/brca_prediction_per_fold.csv")
-    print(f"  {args.output_dir}/brca_prediction_by_r.csv")
-    print(f"  {args.output_dir}/brca_prediction_summary.csv")
+    print(f"  {output_dir}/brca_prediction_per_fold.csv")
+    print(f"  {output_dir}/brca_prediction_by_r.csv")
+    print(f"  {output_dir}/brca_prediction_summary.csv")
 
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

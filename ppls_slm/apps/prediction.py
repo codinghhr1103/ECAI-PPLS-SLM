@@ -6,9 +6,10 @@ This module reproduces and extends the prediction experiments from the paper
 Two experiment tracks are supported:
 
 A) Synthetic PPLS data (paper's main prediction sandbox)
-   - p=q=200, r=50, N=100 (defaults)
+   - p=q=100, r=20, N=120 (defaults; reduced for faster reproducible runs)
    - 5-fold CV
    - Compare predictive accuracy across four methods:
+
         * PPLS-SLM (fitted per fold)
         * PPLS-EM  (fitted per fold)
         * Classical PLS regression (PLSR)
@@ -27,29 +28,13 @@ Evaluation protocol
 
 Usage
 -----
-    python -m ppls_slm.apps.prediction --output_dir results_prediction
+    python -m ppls_slm.apps.prediction --config config.json
 
-Common options
---------------
-  --p INT         Dimension of x            (default: 200)
-  --q INT         Dimension of y            (default: 200)
-  --r INT         Latent dimension          (default: 50)
-  --n_samples INT Sample size               (default: 100)
-  --n_folds INT   CV folds                  (default: 5)
-  --n_starts INT  Multi-start per fold      (default: 16)
-  --seed INT      Random seed               (default: 42)
-  --output_dir    Directory for results     (default: results_prediction)
-  --plot          Generate calibration plot (flag)
+Configuration
+-------------
+All hyperparameters and output paths are read from a single JSON config file.
+See `config.json` under `experiments.prediction`.
 
-PPLS algorithm options
-----------------------
-  --slm_max_iter INT    SLM max iterations (default: 100)
-  --em_max_iter INT     EM max iterations  (default: 200)
-  --em_tol FLOAT        EM relative tolerance (default: 1e-4)
-
-Baseline options
-----------------
-  --no_baselines         Skip PLSR/Ridge baselines
 """
 
 from __future__ import annotations
@@ -59,9 +44,18 @@ import os
 import warnings
 from typing import Dict, List, Optional, Tuple
 
+# NOTE (Windows stability): some BLAS/LAPACK builds may hang or become extremely slow
+# on QR/SVD due to oversubscription or thread deadlocks. Defaulting to 1 thread makes
+# the synthetic-data generation and optimisation steps deterministic and robust.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 import numpy as np
 import pandas as pd
 from scipy import stats
+
 
 from ppls_slm.algorithms import EMAlgorithm, InitialPointGenerator, ScalarLikelihoodMethod
 from ppls_slm.apps.prediction_baselines import compute_regression_metrics, run_plsr_prediction, run_ridge_prediction
@@ -315,6 +309,8 @@ def kfold_prediction_benchmark(
     alphas: Optional[List[float]] = None,
     verbose: bool = True,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    import time
+
     """Run 5-fold CV and return:
 
     - metrics_per_fold: long table (fold, method, MSE/MAE/R2)
@@ -353,6 +349,9 @@ def kfold_prediction_benchmark(
         )
 
         # --- PPLS-SLM ---
+        if verbose:
+            print(f"    Fitting PPLS-SLM (starts={n_starts}, max_iter={slm_max_iter})...", flush=True)
+        _t_fit = time.time()
         slm_params = _fit_ppls_params_slm(
             X_train_s,
             Y_train_s,
@@ -361,7 +360,14 @@ def kfold_prediction_benchmark(
             seed=seed + fold_idx,
             slm_max_iter=slm_max_iter,
         )
+        if verbose:
+            meta = slm_params.get("_meta", {}) if isinstance(slm_params, dict) else {}
+            iters = meta.get("n_iterations")
+            iters_s = f", iters={iters}" if iters is not None else ""
+            print(f"    Done PPLS-SLM in {time.time()-_t_fit:.1f}s{iters_s}.", flush=True)
+
         y_pred_slm_s, Cov_slm_s = _predict_ppls(X_test_s, params=slm_params)
+
         y_pred_slm = _unstandardize_y_pred(y_pred_slm_s, sy)
 
         m_slm = compute_regression_metrics(Y_test, y_pred_slm)
@@ -383,6 +389,9 @@ def kfold_prediction_benchmark(
             calib_rows.append({"fold": fold_idx + 1, "method": "PPLS-SLM", "alpha": float(a), "coverage": cov})
 
         # --- PPLS-EM ---
+        if verbose:
+            print(f"    Fitting PPLS-EM  (starts={n_starts}, max_iter={em_max_iter}, tol={em_tol})...", flush=True)
+        _t_fit = time.time()
         em_params = _fit_ppls_params_em(
             X_train_s,
             Y_train_s,
@@ -392,7 +401,14 @@ def kfold_prediction_benchmark(
             em_max_iter=em_max_iter,
             em_tol=em_tol,
         )
+        if verbose:
+            meta = em_params.get("_meta", {}) if isinstance(em_params, dict) else {}
+            iters = meta.get("n_iterations")
+            iters_s = f", iters={iters}" if iters is not None else ""
+            print(f"    Done PPLS-EM in {time.time()-_t_fit:.1f}s{iters_s}.", flush=True)
+
         y_pred_em_s, Cov_em_s = _predict_ppls(X_test_s, params=em_params)
+
         y_pred_em = _unstandardize_y_pred(y_pred_em_s, sy)
 
         m_em = compute_regression_metrics(Y_test, y_pred_em)
@@ -414,7 +430,13 @@ def kfold_prediction_benchmark(
 
         # --- Baselines ---
         if include_baselines:
+            if verbose:
+                print(f"    Fitting PLSR (n_components={r})...", flush=True)
+            _t_fit = time.time()
             plsr = run_plsr_prediction(X_train, Y_train, X_test, Y_test, n_components=r)
+            if verbose:
+                print(f"    Done PLSR in {time.time()-_t_fit:.1f}s.", flush=True)
+
             m_plsr = plsr["metrics"]
             metrics_rows.append(
                 {
@@ -426,7 +448,13 @@ def kfold_prediction_benchmark(
                 }
             )
 
+            if verbose:
+                print("    Fitting RidgeCV...", flush=True)
+            _t_fit = time.time()
             ridge = run_ridge_prediction(X_train, Y_train, X_test, Y_test)
+            if verbose:
+                print(f"    Done RidgeCV in {time.time()-_t_fit:.1f}s.", flush=True)
+
             m_ridge = ridge["metrics"]
             metrics_rows.append(
                 {
@@ -437,6 +465,7 @@ def kfold_prediction_benchmark(
                     "r2": m_ridge.r2_mean,
                 }
             )
+
 
     metrics_per_fold = pd.DataFrame(metrics_rows)
 
@@ -513,79 +542,134 @@ def plot_calibration(calib_summary: pd.DataFrame, output_dir: str):
 
 def parse_args():
     p = argparse.ArgumentParser(description="PPLS prediction experiment (synthetic)")
-
-    p.add_argument("--p", type=int, default=200)
-    p.add_argument("--q", type=int, default=200)
-    p.add_argument("--r", type=int, default=50)
-    p.add_argument("--n_samples", type=int, default=100)
-    p.add_argument("--n_folds", type=int, default=5)
-    p.add_argument("--n_starts", type=int, default=16)
-
-    p.add_argument("--sigma_e2", type=float, default=0.1)
-    p.add_argument("--sigma_f2", type=float, default=0.1)
-    p.add_argument("--sigma_h2", type=float, default=0.05)
-
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--output_dir", type=str, default="results_prediction")
-
-    p.add_argument("--slm_max_iter", type=int, default=100)
-    p.add_argument("--em_max_iter", type=int, default=200)
-    p.add_argument("--em_tol", type=float, default=1e-4)
-
-    p.add_argument("--no_baselines", action="store_true", help="Skip PLSR and Ridge baselines")
-    p.add_argument("--plot", action="store_true")
-
+    p.add_argument("--config", type=str, required=True, help="Path to config JSON (single source of truth)")
     return p.parse_args()
 
 
 def main():
+    import time
+
     args = parse_args()
-    os.makedirs(args.output_dir, exist_ok=True)
 
-    print("=" * 60)
-    print("Prediction experiment (synthetic)")
-    print("=" * 60)
-    print(f"  p={args.p}, q={args.q}, r={args.r}, N={args.n_samples}")
-    print(f"  folds={args.n_folds}, starts={args.n_starts}")
-    print(f"  SLM: max_iter={args.slm_max_iter} (spectral noise pre-estimation)")
-    print(f"  EM : max_iter={args.em_max_iter}, tol={args.em_tol}")
-    print("=" * 60)
-
-    print("\nGenerating synthetic PPLS data...")
-    X, Y, _true_params = generate_ppls_data(
-        p=args.p,
-        q=args.q,
-        r=args.r,
-        n_samples=args.n_samples,
-        sigma_e2=args.sigma_e2,
-        sigma_f2=args.sigma_f2,
-        sigma_h2=args.sigma_h2,
-        seed=args.seed,
+    from ppls_slm.experiment_config import (
+        coerce_bool,
+        coerce_float,
+        coerce_int,
+        get_experiment_cfg,
+        load_config,
+        require_keys,
     )
-    print(f"  X: {X.shape}, Y: {Y.shape}")
+
+    cfg = load_config(args.config)
+    pred_cfg = get_experiment_cfg(cfg, "prediction")
+
+    require_keys(
+        pred_cfg,
+        [
+            "thread_limit",
+            "output_dir",
+            "p",
+            "q",
+            "r",
+            "n_samples",
+            "n_folds",
+            "n_starts",
+            "seed",
+            "sigma_e2",
+            "sigma_f2",
+            "sigma_h2",
+            "max_iter",
+            "em_tol",
+            "plot",
+            "no_baselines",
+        ],
+        ctx="experiments.prediction",
+    )
+
+    # Coerce basic types
+    for k in ("thread_limit", "p", "q", "r", "n_samples", "n_folds", "n_starts", "seed", "max_iter"):
+        coerce_int(pred_cfg, k, ctx="experiments.prediction")
+    for k in ("sigma_e2", "sigma_f2", "sigma_h2", "em_tol"):
+        coerce_float(pred_cfg, k, ctx="experiments.prediction")
+    for k in ("plot", "no_baselines"):
+        coerce_bool(pred_cfg, k, ctx="experiments.prediction")
+
+    output_dir = str(pred_cfg["output_dir"])
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Runtime thread limiting (more reliable than env vars if NumPy was imported early).
+    try:
+        from threadpoolctl import threadpool_limits
+
+        threadpool_limits(limits=int(pred_cfg["thread_limit"]))
+    except Exception:
+        pass
+
+    print(f"[prediction] using: {__file__}", flush=True)
+    print(f"[prediction] config: {args.config}", flush=True)
+
+    print("=" * 60, flush=True)
+    print("Prediction experiment (synthetic)", flush=True)
+    print("=" * 60, flush=True)
+
+    p_dim = int(pred_cfg["p"])
+    q_dim = int(pred_cfg["q"])
+    r = int(pred_cfg["r"])
+    n_samples = int(pred_cfg["n_samples"])
+    n_folds = int(pred_cfg["n_folds"])
+    n_starts = int(pred_cfg["n_starts"])
+    seed = int(pred_cfg["seed"])
+
+    sigma_e2 = float(pred_cfg["sigma_e2"])
+    sigma_f2 = float(pred_cfg["sigma_f2"])
+    sigma_h2 = float(pred_cfg["sigma_h2"])
+
+    max_iter = int(pred_cfg["max_iter"])
+    em_tol = float(pred_cfg["em_tol"])
+
+    print(f"  p={p_dim}, q={q_dim}, r={r}, N={n_samples}")
+    print(f"  folds={n_folds}, starts={n_starts}")
+    print(f"  SLM/EM: max_iter={max_iter} (spectral noise pre-estimation), tol={em_tol}")
+    print("=" * 60)
+
+    print("\nGenerating synthetic PPLS data...", flush=True)
+    print("  - generating orthonormal loadings + sampling latent variables", flush=True)
+    t0 = time.time()
+    X, Y, _true_params = generate_ppls_data(
+        p=p_dim,
+        q=q_dim,
+        r=r,
+        n_samples=n_samples,
+        sigma_e2=sigma_e2,
+        sigma_f2=sigma_f2,
+        sigma_h2=sigma_h2,
+        seed=seed,
+    )
+    print(f"  X: {X.shape}, Y: {Y.shape}", flush=True)
+    print(f"  data generation took {time.time()-t0:.3f}s", flush=True)
 
     alphas = [0.05, 0.10, 0.15, 0.20, 0.25]
 
-    print(f"\nRunning {args.n_folds}-fold CV benchmark...")
+    print(f"\nRunning {n_folds}-fold CV benchmark...", flush=True)
     metrics_per_fold, metrics_summary, calib_summary = kfold_prediction_benchmark(
         X,
         Y,
-        r=args.r,
-        n_folds=args.n_folds,
-        n_starts=args.n_starts,
-        seed=args.seed,
-        slm_max_iter=args.slm_max_iter,
-        em_max_iter=args.em_max_iter,
-        em_tol=args.em_tol,
-        include_baselines=(not args.no_baselines),
+        r=r,
+        n_folds=n_folds,
+        n_starts=n_starts,
+        seed=seed,
+        slm_max_iter=max_iter,
+        em_max_iter=max_iter,
+        em_tol=em_tol,
+        include_baselines=(not bool(pred_cfg["no_baselines"])),
         alphas=alphas,
         verbose=True,
     )
 
     # Save
-    metrics_per_fold.to_csv(os.path.join(args.output_dir, "prediction_metrics_per_fold.csv"), index=False)
-    metrics_summary.to_csv(os.path.join(args.output_dir, "prediction_metrics_summary.csv"), index=False)
-    calib_summary.to_csv(os.path.join(args.output_dir, "calibration_comparison.csv"), index=False)
+    metrics_per_fold.to_csv(os.path.join(output_dir, "prediction_metrics_per_fold.csv"), index=False)
+    metrics_summary.to_csv(os.path.join(output_dir, "prediction_metrics_summary.csv"), index=False)
+    calib_summary.to_csv(os.path.join(output_dir, "calibration_comparison.csv"), index=False)
 
     print("\n── Prediction metrics (mean ± std across folds) ──")
     disp = metrics_summary.copy()
@@ -599,11 +683,11 @@ def main():
     disp_c["PPLS-EM"] = disp_c["PPLS-EM_mean"].map(lambda x: f"{x:.2f}") + " ± " + disp_c["PPLS-EM_std"].map(lambda x: f"{x:.2f}")
     print(disp_c[["alpha", "expected_coverage", "PPLS-SLM", "PPLS-EM"]].to_string(index=False))
 
-    if args.plot:
-        plot_calibration(calib_summary, args.output_dir)
-        print(f"\nSaved plot: {args.output_dir}/calibration_plot.png")
+    if bool(pred_cfg["plot"]):
+        plot_calibration(calib_summary, output_dir)
+        print(f"\nSaved plot: {output_dir}/calibration_plot.png")
 
-    print(f"\nResults saved to: {args.output_dir}/")
+    print(f"\nResults saved to: {output_dir}/")
     print("Prediction experiment complete.")
 
     return metrics_summary
@@ -611,3 +695,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

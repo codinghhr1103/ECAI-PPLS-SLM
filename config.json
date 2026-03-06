@@ -56,8 +56,8 @@
     "save_intermediate": true,
     "base_dir": "C:/Users/ASUS/Desktop/ECAI-PPLS-SLM/output",
     "figure_format": "png",
-    "force_data_generation": false,
-    "force_parameter_estimation": false,
+    "force_data_generation": true,
+    "force_parameter_estimation": true,
     "force_visualization": true
   },
   "analysis": {
@@ -71,6 +71,8 @@
       "speed": true,
       "association": true,
       "prediction": true,
+      "brca_prediction": false,
+      "brca_calibration": false,
       "sync_artifacts": true
     },
     "association": {
@@ -78,9 +80,45 @@
       "output_dir": "results_association"
     },
     "prediction": {
+      "thread_limit": 1,
       "output_dir": "results_prediction",
-      "use_slm": false,
-      "use_true": true
+      "p": 100,
+      "q": 100,
+      "r": 20,
+      "n_samples": 120,
+      "n_folds": 5,
+      "n_starts": 8,
+      "seed": 42,
+      "sigma_e2": 0.1,
+      "sigma_f2": 0.1,
+      "sigma_h2": 0.05,
+      "max_iter": 1000,
+      "em_tol": 1e-4,
+      "plot": true,
+      "no_baselines": false
+    },
+    "prediction_brca": {
+      "thread_limit": 1,
+      "brca_data": "application/brca_data_w_subtypes.csv.zip",
+      "output_dir": "results_prediction_brca",
+      "seed": 42,
+      "n_folds": 5,
+      "r_grid": "3,5,8,10",
+      "n_starts": 8,
+      "max_iter": 1000,
+      "em_tol": 1e-4
+    },
+    "calibration_brca": {
+      "thread_limit": 1,
+      "brca_data": "application/brca_data_w_subtypes.csv.zip",
+      "output_dir": "results_prediction_brca",
+      "prediction_summary": "results_prediction_brca/brca_prediction_summary.csv",
+      "seed": 42,
+      "n_folds": 5,
+      "r": null,
+      "n_starts": 8,
+      "max_iter": 1000
     }
   }
 }
+

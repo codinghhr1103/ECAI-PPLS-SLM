@@ -176,30 +176,62 @@ def run_calibration(
 
 def parse_args():
     p = argparse.ArgumentParser(description="BRCA calibration (PPLS-SLM)")
-    p.add_argument("--brca_data", type=str, default="application/brca_data_w_subtypes.csv.zip")
-    p.add_argument("--prediction_summary", type=str, default="results_prediction_brca/brca_prediction_summary.csv")
-    p.add_argument("--output_dir", type=str, default="results_prediction_brca")
-
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--n_folds", type=int, default=5)
-    p.add_argument("--r", type=int, default=None, help="Override best r (otherwise read from summary)")
-
-    p.add_argument("--slm_n_starts", type=int, default=8)
-    p.add_argument("--slm_max_iter", type=int, default=50)
-
+    p.add_argument("--config", type=str, required=True, help="Path to config JSON (single source of truth)")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-    os.makedirs(args.output_dir, exist_ok=True)
 
-    if args.r is None:
-        r = _best_r_from_summary(args.prediction_summary)
+    from ppls_slm.experiment_config import (
+        coerce_float,
+        coerce_int,
+        get_experiment_cfg,
+        load_config,
+        require_keys,
+    )
+
+    cfg = load_config(args.config)
+    calib_cfg = get_experiment_cfg(cfg, "calibration_brca")
+
+    require_keys(
+        calib_cfg,
+        [
+            "thread_limit",
+            "brca_data",
+            "output_dir",
+            "prediction_summary",
+            "seed",
+            "n_folds",
+            "r",
+            "n_starts",
+            "max_iter",
+        ],
+        ctx="experiments.calibration_brca",
+    )
+
+    for k in ("thread_limit", "seed", "n_folds", "n_starts", "max_iter"):
+        coerce_int(calib_cfg, k, ctx="experiments.calibration_brca")
+
+    output_dir = str(calib_cfg["output_dir"])
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Runtime thread limiting
+    try:
+        from threadpoolctl import threadpool_limits
+
+        threadpool_limits(limits=int(calib_cfg["thread_limit"]))
+    except Exception:
+        pass
+
+    # r=null means "read best r from summary"
+    r_val = calib_cfg.get("r")
+    if r_val is None:
+        r = _best_r_from_summary(str(calib_cfg["prediction_summary"]))
     else:
-        r = int(args.r)
+        r = int(r_val)
 
-    X, Y = load_brca_combined_raw(args.brca_data)
+    X, Y = load_brca_combined_raw(str(calib_cfg["brca_data"]))
     print(f"Loaded BRCA: X={X.shape}, Y={Y.shape}")
     print(f"Using r={r} for calibration")
 
@@ -208,14 +240,14 @@ def main():
         X,
         Y,
         r=r,
-        n_folds=args.n_folds,
-        seed=args.seed,
-        n_starts=args.slm_n_starts,
-        max_iter=args.slm_max_iter,
+        n_folds=int(calib_cfg["n_folds"]),
+        seed=int(calib_cfg["seed"]),
+        n_starts=int(calib_cfg["n_starts"]),
+        max_iter=int(calib_cfg["max_iter"]),
         alphas=alphas,
     )
 
-    out_csv = os.path.join(args.output_dir, "brca_calibration_table.csv")
+    out_csv = os.path.join(output_dir, "brca_calibration_table.csv")
     table.to_csv(out_csv, index=False)
     print(f"Saved: {out_csv}")
 
@@ -224,3 +256,4 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
