@@ -176,19 +176,20 @@ class ScalarLikelihoodMethod(PPLSAlgorithm):
         S = (XY_c.T @ XY_c) / N
 
         # Decide how to obtain noise variances.
-        if self.fixed_sigma_e2 is not None:
+        if (self.fixed_sigma_e2 is not None) and (self.fixed_sigma_f2 is not None):
             sigma_e2 = float(self.fixed_sigma_e2)
-        elif self.use_noise_preestimation:
-            sigma_e2, _ = NoiseEstimator.estimate_noise_variances(X, Y)
-        else:
-            sigma_e2 = 0.01
-
-        if self.fixed_sigma_f2 is not None:
             sigma_f2 = float(self.fixed_sigma_f2)
         elif self.use_noise_preestimation:
-            _, sigma_f2 = NoiseEstimator.estimate_noise_variances(X, Y)
+            sigma_e2, sigma_f2 = NoiseEstimator.estimate_noise_variances(X, Y, r=self.r)
         else:
-            sigma_f2 = 0.01
+            sigma_e2, sigma_f2 = 0.01, 0.01
+
+        # Allow overriding only one side if needed.
+        if self.fixed_sigma_e2 is not None:
+            sigma_e2 = float(self.fixed_sigma_e2)
+        if self.fixed_sigma_f2 is not None:
+            sigma_f2 = float(self.fixed_sigma_f2)
+
 
         constraints = PPLSConstraints.get_inequality_constraints(
             self.p, self.q, self.r, slack=self.constraint_slack

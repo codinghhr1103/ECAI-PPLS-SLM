@@ -340,14 +340,25 @@ def kfold_prediction_experiment(
 
     rows = []
     for fold_idx, test_idx in enumerate(folds):
-        train_idx = np.concatenate([folds[j] for j in range(n_folds) if j != fold_idx])
+        # Special-case n_folds=1 for quick debugging: use all samples for both train and test.
+        if n_folds <= 1:
+            train_idx = indices
+        else:
+            train_idx = np.concatenate([folds[j] for j in range(n_folds) if j != fold_idx])
 
         X_train, Y_train = X[train_idx], Y[train_idx]
         X_test,  Y_test  = X[test_idx],  Y[test_idx]
 
         if verbose:
-            print(f"  Fold {fold_idx+1}/{n_folds}  "
-                  f"(train={len(train_idx)}, test={len(test_idx)})", end="  ")
+            # Print a full line so the one-click runner (which reads stdout line-by-line)
+            # can stream progress immediately even if the fold fit takes a long time.
+            print(
+                f"  Fold {fold_idx+1}/{n_folds}  "
+                f"(train={len(train_idx)}, test={len(test_idx)})",
+                flush=True,
+            )
+
+
 
         fold_res = fit_and_predict_fold(
             X_train, Y_train, X_test, Y_test,

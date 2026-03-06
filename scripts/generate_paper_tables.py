@@ -478,7 +478,8 @@ def generate_noise_ablation_exp1_table(*, artifacts_dir: Path, out_path: Path) -
         raise ValueError(f"Unexpected exp1_preestimate_accuracy columns; missing={sorted(missing)}")
 
     snr_order = ["lowSNR", "midSNR", "highSNR"]
-    N_order = [100, 500, 2000, 5000]
+    N_order = [200, 500, 2000, 5000]
+
 
     df = df.copy()
     df["snr"] = df["snr"].astype(str)

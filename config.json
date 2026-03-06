@@ -79,28 +79,24 @@
       "output_dir": "results_association"
     },
     "prediction": {
-      "output_dir": "results_prediction"
+      "output_dir": "results_prediction",
+      "use_slm": false,
+      "use_true": true
     },
     "noise_ablation": {
       "output_dir": "output/noise_ablation",
-
       "fast": true,
-
       "exp2_M": 3,
       "exp2_n_starts": 4,
       "slm_max_iter": 40,
-
       "exp2_p": 20,
       "exp2_q": 20,
       "exp2_r": 3,
       "exp2_N": 300,
-
       "exp2_optimizer": "trust-constr",
       "exp2_gtol": 0.01,
       "exp2_xtol": 0.01,
       "exp2_barrier_tol": 0.01
     }
-
-
   }
 }

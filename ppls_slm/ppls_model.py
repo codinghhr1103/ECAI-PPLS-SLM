@@ -12,11 +12,13 @@ Classes:
     PPLSModel        – covariance matrix, log-likelihood, sampling
     PPLSObjective    – scalar-form log-likelihood for optimisation
     PPLSConstraints  – orthonormality and bound constraints
-    NoiseEstimator   – closed-form pre-estimation of sigma_e^2, sigma_f^2
+    NoiseEstimator   – spectral pre-estimation of sigma_e^2, sigma_f^2
+
 """
 
 import numpy as np
-from typing import Tuple, Dict
+from typing import Tuple, Dict, Optional
+
 
 
 class PPLSModel:
@@ -282,40 +284,81 @@ class PPLSConstraints:
         return PPLSConstraints.get_inequality_constraints(p, q, r, slack)
 
 
-class NoiseEstimator:
+def estimate_noise_variance(
+    data: np.ndarray,
+    r: int,
+    mp_correction_threshold: float = 0.1,
+) -> float:
+    """\
+    基于特征值分离的噪声方差估计器。
+
+    利用 PPLS 模型中协方差矩阵 \(\Sigma = W\Sigma_tW^\top + \sigma^2 I\) 的谱结构，
+    取样本协方差矩阵最小 \(d-r\) 个特征值的均值来估计 \(\sigma^2\)。
+
+    Parameters
+    ----------
+    data : np.ndarray, shape (N, d)
+        观测数据矩阵
+    r : int
+        潜在维度
+    mp_correction_threshold : float
+        当 d/N 超过此阈值时启用 Marchenko--Pastur 一阶修正
+
+    Returns
+    -------
+    sigma2 : float
+        估计的噪声方差
     """
-    Closed-form pre-estimation of observation noise variances (per-dimension):
+    if data.ndim != 2:
+        raise ValueError(f"data must be 2D array, got shape={getattr(data, 'shape', None)}")
 
-        sigma_e^2 = (1/(N p)) sum_i ||x_i - x_bar||^2
-        sigma_f^2 = (1/(N q)) sum_i ||y_i - y_bar||^2
+    N, d = data.shape
+    r = int(r)
+    if not (0 <= r < d):
+        raise ValueError(f"latent dimension r must satisfy 0 <= r < d, got r={r}, d={d}")
 
-    These match Eq. (sigma_e_hat) / (sigma_f_hat) in the paper.
+    # 中心化样本协方差 (1/N)
+    data_centered = data - data.mean(axis=0, keepdims=True)
+    S = (data_centered.T @ data_centered) / float(N)
+
+    # 特征值（numpy.eigvalsh 返回升序）
+    eigenvalues = np.linalg.eigvalsh(S)
+
+    # 最小 d-r 个特征值的均值
+    sigma2 = float(np.mean(eigenvalues[: d - r]))
+
+    # Marchenko--Pastur 一阶修正（当 d/N 不可忽略时）
+    if (N > 1) and (d / float(N) > float(mp_correction_threshold)):
+        sigma2 /= (1.0 + (d - r) / float(N - 1))
+
+    return max(sigma2, 1e-10)
+
+
+class NoiseEstimator:
+    """\
+    Spectral pre-estimation of observation noise variances (per-dimension).
+
+    Under the PPLS marginal structure
+        \Sigma_x = W\Sigma_tW^\top + \sigma_e^2 I_p,
+    the noise subspace has exactly \(p-r\) eigenvalues equal to \(\sigma_e^2\).
+    We estimate \(\sigma_e^2\) by averaging the smallest \(p-r\) sample eigenvalues
+    of the centered sample covariance; similarly for \(\sigma_f^2\) in the y-space.
+
+    The implementation optionally applies a first-order Marchenko--Pastur correction
+    when d/N is not negligible.
     """
 
     @staticmethod
-    def estimate_noise_variances(X: np.ndarray, Y: np.ndarray) -> Tuple[float, float]:
-        """
-        Parameters
-        ----------
-        X : (N, p) input data
-        Y : (N, q) output data
+    def estimate_noise_variances(
+        X: np.ndarray,
+        Y: np.ndarray,
+        r: Optional[int] = None,
+        mp_correction_threshold: float = 0.1,
+    ) -> Tuple[float, float]:
+        """Estimate (sigma_e^2, sigma_f^2) via spectral separation."""
+        if r is None:
+            raise ValueError("r must be provided for spectral noise estimation")
 
-        Returns
-        -------
-        sigma_e2, sigma_f2 : estimated noise variances
-        """
-        N = X.shape[0]
-
-        X_centered = X - np.mean(X, axis=0, keepdims=True)
-        Y_centered = Y - np.mean(Y, axis=0, keepdims=True)
-
-        p = X.shape[1]
-        q = Y.shape[1]
-
-        # MLE for isotropic noise variance per dimension:
-        #   \hat{\sigma}_e^2 = (1/(N p)) \sum_i ||x_i-\bar{x}||^2
-        #   \hat{\sigma}_f^2 = (1/(N q)) \sum_i ||y_i-\bar{y}||^2
-        sigma_e2 = np.sum(X_centered ** 2) / (N * p)
-        sigma_f2 = np.sum(Y_centered ** 2) / (N * q)
-
-        return max(float(sigma_e2), 1e-6), max(float(sigma_f2), 1e-6)
+        sigma_e2 = estimate_noise_variance(X, r, mp_correction_threshold=mp_correction_threshold)
+        sigma_f2 = estimate_noise_variance(Y, r, mp_correction_threshold=mp_correction_threshold)
+        return float(sigma_e2), float(sigma_f2)

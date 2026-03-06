@@ -362,10 +362,25 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
         # 4) Prediction
         if run_prediction:
-            cmd = [sys.executable, "-m", "ppls_slm.apps.prediction", "--output_dir", str(pred_out), "--plot"]
+            cmd = [sys.executable, "-u", "-m", "ppls_slm.apps.prediction", "--output_dir", str(pred_out)]
+
+            # Optional config-driven knobs (defaults are defined in the app).
+            if bool(pred_cfg.get("plot", True)):
+                cmd += ["--plot"]
+
+            if bool(pred_cfg.get("use_slm", False)):
+                cmd += ["--use_slm"]
+            elif bool(pred_cfg.get("use_true", False)):
+                cmd += ["--use_true"]
+
+            for k in ("p", "q", "r", "n_samples", "n_folds", "n_starts", "seed", "sigma_e2", "sigma_f2", "sigma_h2"):
+                if k in pred_cfg and pred_cfg.get(k) is not None:
+                    cmd += [f"--{k}", str(pred_cfg.get(k))]
+
             code = tee_run(cmd, cwd=repo_root, log_path=logs_dir / "04_prediction.log", env=run_env)
             if code != 0:
                 return code
+
 
         # 5) Noise pre-estimation ablation (Section 5 theory validation)
         if run_noise_ablation:

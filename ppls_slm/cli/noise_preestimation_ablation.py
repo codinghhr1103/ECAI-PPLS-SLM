@@ -26,8 +26,9 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 from ppls_slm.data_generator import SineDataGenerator
-from ppls_slm.ppls_model import NoiseEstimator, PPLSModel
+from ppls_slm.ppls_model import estimate_noise_variance, NoiseEstimator, PPLSModel
 from ppls_slm.algorithms import InitialPointGenerator, ScalarLikelihoodMethod
+
 
 
 @dataclass(frozen=True)
@@ -113,27 +114,29 @@ def _sample_ppls(
     return X, Y, S_signal
 
 
-def _sigma_hat_e2(X: np.ndarray) -> float:
-    N, p = X.shape
-    Xc = X - X.mean(axis=0, keepdims=True)
-    return float(np.sum(Xc ** 2) / (N * p))
+def _sigma_hat_e2(X: np.ndarray, r: int, mp_correction_threshold: float = 0.1) -> float:
+    """Spectral estimator used in the paper: average of smallest (p-r) eigenvalues."""
+    return float(estimate_noise_variance(X, r=int(r), mp_correction_threshold=float(mp_correction_threshold)))
 
 
 def _theorem_noise_bound(
     *,
-    epsilon: float,
     sigma_e2: float,
     N: int,
     p: int,
+    r: int,
     delta: float,
 ) -> float:
-    """Theorem bound (Eq. noise_error_bound) for |sigma_hat - sigma_e2|."""
-    sigma_e = float(np.sqrt(sigma_e2))
-    term1 = (epsilon ** 2) / p
-    term2 = (2.0 * sigma_e * epsilon) / (np.sqrt(N) * p)
-    term3 = sigma_e2 * np.sqrt((2.0 / (N * p)) * np.log(4.0 / delta))
-    term4 = sigma_e2 / N
-    return float(term1 + term2 + term3 + term4)
+    """Theorem 5.1 bound for the spectral noise variance estimator.
+
+    Main term:  sigma_e2 * sqrt(2 ln(4/delta) / (N (p-r))).
+    We add a small higher-order correction of order O(p/N^2) with unit constant
+    to match the paper statement.
+    """
+    main = float(sigma_e2) * float(np.sqrt((2.0 * np.log(4.0 / float(delta))) / (float(N) * float(p - r))))
+    higher_order = float(sigma_e2) * (float(p) / (float(N) ** 2))
+    return float(main + higher_order)
+
 
 
 def _align_signs(W_est: np.ndarray, C_est: np.ndarray, B_est: np.ndarray,
@@ -198,23 +201,19 @@ def experiment_1_preestimate_accuracy(
         for N in Ns:
             rel_errors = []
             rel_bounds = []
-            epsilons = []
 
             for m in range(M):
                 rng = np.random.default_rng(seed + 10000 * snr_idx + 37 * N + m)
-                X, _, S_signal = _sample_ppls(params, n_samples=N, rng=rng)
+                X, _, _ = _sample_ppls(params, n_samples=N, rng=rng)
 
-                sigma_hat = _sigma_hat_e2(X)
+                sigma_hat = _sigma_hat_e2(X, r=r)
                 rel_err = abs(sigma_hat - sigma_e2) / sigma_e2
 
-                s_bar = S_signal.mean(axis=0, keepdims=True)
-                epsilon = float(np.max(np.linalg.norm(S_signal - s_bar, axis=1)))
-                bound = _theorem_noise_bound(epsilon=epsilon, sigma_e2=sigma_e2, N=N, p=p, delta=delta)
+                bound = _theorem_noise_bound(sigma_e2=sigma_e2, N=N, p=p, r=r, delta=delta)
                 rel_bound = bound / sigma_e2
 
                 rel_errors.append(rel_err)
                 rel_bounds.append(rel_bound)
-                epsilons.append(epsilon)
 
             rows.append({
                 "snr": snr_name,
@@ -225,9 +224,8 @@ def experiment_1_preestimate_accuracy(
                 "rel_error_std": float(np.std(rel_errors)),
                 "rel_bound_mean": float(np.mean(rel_bounds)),
                 "rel_bound_std": float(np.std(rel_bounds)),
-                "epsilon_mean": float(np.mean(epsilons)),
-                "epsilon_std": float(np.std(epsilons)),
             })
+
 
     df = pd.DataFrame(rows).sort_values(["snr", "N"])
     df.to_csv(os.path.join(out_dir, "exp1_preestimate_accuracy.csv"), index=False)
@@ -660,7 +658,7 @@ def main() -> None:
             p=100,
             q=100,
             r=5,
-            Ns=[100, 500, 2000, 5000],
+            Ns=[200, 500, 2000, 5000],
             snr_sigma_t_diags={
                 "lowSNR": 0.1,
                 "midSNR": 1.0,
