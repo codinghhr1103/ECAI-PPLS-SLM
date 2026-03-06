@@ -406,7 +406,7 @@ def generate_prediction_synthetic_metrics_table(*, artifacts_dir: Path, out_path
     tex.append(r"\textbf{Method} & \textbf{MSE} & \textbf{MAE} & \textbf{$R^2$} \\")
     tex.append(r"\midrule")
     for method, mse, mae, r2 in rows:
-        tex.append(f"{method} & {mse} & {mae} & {r2} \\")
+        tex.append(f"{method} & {mse} & {mae} & {r2} \\\\ ")
     tex.append(r"\bottomrule")
     tex.append(r"\end{tabular}")
     tex.append(r"\end{table}")
@@ -442,7 +442,7 @@ def generate_prediction_synthetic_calibration_table(*, artifacts_dir: Path, out_
         expc = fmt_pct(r["expected_coverage"])
         slm = f"{fmt_pct(r['PPLS-SLM_mean'])} $\\pm$ {fmt_pct(r['PPLS-SLM_std'])}"
         em = f"{fmt_pct(r['PPLS-EM_mean'])} $\\pm$ {fmt_pct(r['PPLS-EM_std'])}"
-        tex.append(f"{a:.2f} & {expc} & {slm} & {em} \\")
+        tex.append(f"{a:.2f} & {expc} & {slm} & {em} \\\\ ")
 
     tex.append(r"\bottomrule")
     tex.append(r"\end{tabular}")
@@ -862,15 +862,27 @@ def main() -> None:
     generate_prediction_synthetic_metrics_table(artifacts_dir=artifacts_dir, out_path=out_dir / "tab_prediction_synth_metrics.tex")
     generate_prediction_synthetic_calibration_table(artifacts_dir=artifacts_dir, out_path=out_dir / "tab_prediction_synth_calibration.tex")
 
-    # BRCA
-    generate_prediction_brca_metrics_table(artifacts_dir=artifacts_dir, out_path=out_dir / "tab_prediction_brca_metrics.tex")
-    generate_prediction_brca_calibration_table(artifacts_dir=artifacts_dir, out_path=out_dir / "tab_prediction_brca_calibration.tex")
+    # BRCA (optional in config; skip cleanly when artifacts are absent)
+    brca_dir = artifacts_dir / "prediction" / "brca"
+    if (brca_dir / "brca_prediction_summary.csv").exists():
+        generate_prediction_brca_metrics_table(artifacts_dir=artifacts_dir, out_path=out_dir / "tab_prediction_brca_metrics.tex")
+    else:
+        print(f"[SKIP] BRCA prediction table (missing: {brca_dir / 'brca_prediction_summary.csv'})")
+
+    if (brca_dir / "brca_calibration_table.csv").exists():
+        generate_prediction_brca_calibration_table(artifacts_dir=artifacts_dir, out_path=out_dir / "tab_prediction_brca_calibration.tex")
+    else:
+        print(f"[SKIP] BRCA calibration table (missing: {brca_dir / 'brca_calibration_table.csv'})")
 
     # Legacy coverage table (kept for backward compatibility).
-    generate_prediction_coverage_table(artifacts_dir=artifacts_dir, out_path=out_dir / "tab_prediction_coverage.tex")
-
+    # (Some older paper drafts reference it.)
+    try:
+        generate_prediction_coverage_table(artifacts_dir=artifacts_dir, out_path=out_dir / "tab_prediction_coverage.tex")
+    except FileNotFoundError as e:
+        print(f"[SKIP] Legacy coverage table ({e})")
 
     generate_paper_metrics(artifacts_dir=artifacts_dir, out_path=paper_dir / "generated" / "metrics.tex")
+
 
 
     print(f"[OK] Wrote tables into: {out_dir}")
