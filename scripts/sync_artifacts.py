@@ -99,18 +99,7 @@ def main() -> int:
     copied += int(copy_file(pred_root / "calibration_plot.png", pred_dir / "calibration_plot.png"))
     copied += int(copy_file(pred_root / "prediction_example.png", pred_dir / "prediction_example.png"))
 
-    # --- Noise pre-estimation ablation ---
-    noise_src_candidates = [
-        repo_root / "output" / "noise_ablation",
-        repo_root / "output" / "noise_preestimation_ablation",
-    ]
-    noise_src = next((p for p in noise_src_candidates if p.exists()), None)
-    noise_dir = artifacts / "noise_ablation"
-    if noise_src is None:
-        print(f"[MISS] noise ablation outputs (tried: {', '.join(str(p) for p in noise_src_candidates)})")
-    else:
-        copied += copy_glob(noise_src / "exp1_preestimate_accuracy", "*", noise_dir / "exp1_preestimate_accuracy")
-        copied += copy_glob(noise_src / "exp2_joint_vs_fixed", "*", noise_dir / "exp2_joint_vs_fixed")
+
 
 
     # Also generate LaTeX tables from the synced artifacts so the paper stays consistent.

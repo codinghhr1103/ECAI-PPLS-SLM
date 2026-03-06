@@ -206,8 +206,11 @@ def experiment_1_preestimate_accuracy(
                 rng = np.random.default_rng(seed + 10000 * snr_idx + 37 * N + m)
                 X, _, _ = _sample_ppls(params, n_samples=N, rng=rng)
 
-                sigma_hat = _sigma_hat_e2(X, r=r)
+                # For Exp1 we evaluate the base spectral estimator (without MP correction)
+                # to match the assumptions of Theorem~5.1 (notably N > p).
+                sigma_hat = _sigma_hat_e2(X, r=r, mp_correction_threshold=1.0)
                 rel_err = abs(sigma_hat - sigma_e2) / sigma_e2
+
 
                 bound = _theorem_noise_bound(sigma_e2=sigma_e2, N=N, p=p, r=r, delta=delta)
                 rel_bound = bound / sigma_e2
@@ -230,24 +233,43 @@ def experiment_1_preestimate_accuracy(
     df = pd.DataFrame(rows).sort_values(["snr", "N"])
     df.to_csv(os.path.join(out_dir, "exp1_preestimate_accuracy.csv"), index=False)
 
-    # Plot: relative error vs N, overlay theoretical bound (dashed)
-    fig, ax = plt.subplots(figsize=(6.2, 4.2))
+    # Plot: relative error vs N (with error bars), overlay theoretical bound (dashed)
+    fig, ax = plt.subplots(figsize=(6.6, 4.2))
     for snr_name in snr_sigma_t_diags.keys():
         sub = df[df["snr"] == snr_name]
-        ax.plot(sub["N"], sub["rel_error_mean"], marker="o", label=f"{snr_name}: empirical")
-        ax.plot(sub["N"], sub["rel_bound_mean"], linestyle="--", marker=None, label=f"{snr_name}: Theorem bound")
+
+        # Empirical mean ± std across repetitions
+        ax.errorbar(
+            sub["N"],
+            sub["rel_error_mean"],
+            yerr=sub["rel_error_std"],
+            marker="o",
+            capsize=3,
+            linewidth=1.5,
+            label=f"{snr_name}: empirical",
+        )
+
+        # Theorem bound (mean; deterministic given N in our setup)
+        ax.plot(
+            sub["N"],
+            sub["rel_bound_mean"],
+            linestyle="--",
+            linewidth=1.2,
+            label=f"{snr_name}: bound",
+        )
 
     ax.set_xscale("log")
     ax.set_yscale("log")
     ax.set_xlabel("N")
     ax.set_ylabel(r"Relative error $|\hat{\sigma}_e^2-\sigma_e^2|/\sigma_e^2$")
-    ax.set_title(r"Noise pre-estimation accuracy vs $N$ (with Theorem bound)")
+    ax.set_title(r"Noise pre-estimation accuracy vs $N$")
     ax.legend(ncol=1, fontsize=9)
     ax.grid(True, which="both", alpha=0.25)
 
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, "exp1_preestimate_accuracy.png"), dpi=300)
     plt.close(fig)
+
 
     with open(os.path.join(out_dir, "exp1_config.json"), "w", encoding="utf-8") as f:
         json.dump({
@@ -488,7 +510,8 @@ def experiment_2_ablation_joint_vs_fixed(
     summary.to_csv(os.path.join(out_dir, "exp2_summary_table.csv"), index=False)
 
     # Plot a compact comparison figure for the paper.
-    # We visualise (i) success rate and (ii) mean runtime (including failed runs), by noise level and scheme.
+    # We visualise (i) success rate, (ii) mean runtime, and (iii) mean iterations by noise level and scheme.
+    # Runtime/iterations are averaged over successful runs (when available).
     try:
         dfs = []
         for noise in noise_levels:
@@ -499,16 +522,25 @@ def experiment_2_ablation_joint_vs_fixed(
         if dfs:
             df_all = pd.concat(dfs, ignore_index=True)
 
-            agg_all = df_all.groupby(["noise", "scheme"], as_index=False).agg(
-                success_rate=("success", "mean"),
-                runtime_sec_mean=("runtime_sec", "mean"),
+            def _mean_ok(series: pd.Series, success: pd.Series) -> float:
+                ok = series[success == 1]
+                return float(ok.mean()) if len(ok) else float("nan")
+
+            agg_all = (
+                df_all.groupby(["noise", "scheme"], as_index=False)
+                .apply(lambda g: pd.Series({
+                    "success_rate": float(g["success"].mean()),
+                    "runtime_sec_mean_ok": _mean_ok(g["runtime_sec"], g["success"]),
+                    "n_iterations_mean_ok": _mean_ok(g["n_iterations"], g["success"]),
+                }))
+                .reset_index(drop=True)
             )
 
             # Keep x-axis order consistent with the configured noise grid.
             order = [n.name for n in noise_levels]
             agg_all["noise"] = pd.Categorical(agg_all["noise"], categories=order, ordered=True)
 
-            fig, axes = plt.subplots(1, 2, figsize=(9.0, 3.6))
+            fig, axes = plt.subplots(1, 3, figsize=(12.0, 3.6))
 
             # success rate
             ax = axes[0]
@@ -523,15 +555,26 @@ def experiment_2_ablation_joint_vs_fixed(
             ax.grid(True, axis="y", alpha=0.25)
             ax.legend(fontsize=9)
 
-            # runtime
+            # runtime (successful runs)
             ax = axes[1]
             for scheme in ["A_fixed", "B_joint"]:
                 sub = agg_all[agg_all["scheme"] == scheme].sort_values("noise")
                 xs = sub["noise"].astype(str).tolist()
-                ys = sub["runtime_sec_mean"].values
+                ys = sub["runtime_sec_mean_ok"].values
                 ax.plot(xs, ys, marker="o", label=scheme)
             ax.set_ylabel("Mean runtime (sec)")
-            ax.set_title("Exp2: runtime")
+            ax.set_title("Exp2: runtime (success only)")
+            ax.grid(True, axis="y", alpha=0.25)
+
+            # iterations (successful runs)
+            ax = axes[2]
+            for scheme in ["A_fixed", "B_joint"]:
+                sub = agg_all[agg_all["scheme"] == scheme].sort_values("noise")
+                xs = sub["noise"].astype(str).tolist()
+                ys = sub["n_iterations_mean_ok"].values
+                ax.plot(xs, ys, marker="o", label=scheme)
+            ax.set_ylabel("Mean iterations")
+            ax.set_title("Exp2: iterations (success only)")
             ax.grid(True, axis="y", alpha=0.25)
 
             fig.suptitle("Noise ablation Exp2: fixed vs joint optimisation", y=1.02)
@@ -540,6 +583,7 @@ def experiment_2_ablation_joint_vs_fixed(
             plt.close(fig)
     except Exception:
         pass
+
 
     with open(os.path.join(out_dir, "exp2_config.json"), "w", encoding="utf-8") as f:
         json.dump({
@@ -700,12 +744,6 @@ def main() -> None:
             barrier_tol=float(args.exp2_barrier_tol),
             noise_levels=noise_levels,
         )
-
-
-
-
-    print(f"[OK] Done. Outputs written to: {os.path.abspath(out_dir)}")
-
 
 
 if __name__ == "__main__":

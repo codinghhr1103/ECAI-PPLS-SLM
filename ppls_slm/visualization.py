@@ -195,14 +195,17 @@ class PPLSVisualizer:
         """
         # Extract convergence data (iterations are summarised over successful trials only).
         slm_iterations: List[int] = []
+        slm_joint_iterations: List[int] = []
         slm_oracle_iterations: List[int] = []
         em_iterations: List[int] = []
         ecm_iterations: List[int] = []
 
         slm_success: List[int] = []
+        slm_joint_success: List[int] = []
         slm_oracle_success: List[int] = []
         em_success: List[int] = []
         ecm_success: List[int] = []
+
 
         for trial in trial_results:
             slm_res = trial.get('slm_results', {})
@@ -211,12 +214,17 @@ class PPLSVisualizer:
             if slm_ok and 'n_iterations' in slm_res:
                 slm_iterations.append(int(slm_res['n_iterations']))
 
+            slm_joint_res = trial.get('slm_joint_results', {})
+            slm_joint_ok = bool(slm_joint_res.get('success', False))
+            slm_joint_success.append(int(slm_joint_ok))
+            if slm_joint_ok and 'n_iterations' in slm_joint_res:
+                slm_joint_iterations.append(int(slm_joint_res['n_iterations']))
+
             slm_or_res = trial.get('slm_oracle_results', {})
-            if slm_or_res:
-                slm_or_ok = bool(slm_or_res.get('success', False))
-                slm_oracle_success.append(int(slm_or_ok))
-                if slm_or_ok and 'n_iterations' in slm_or_res:
-                    slm_oracle_iterations.append(int(slm_or_res['n_iterations']))
+            slm_or_ok = bool(slm_or_res.get('success', False))
+            slm_oracle_success.append(int(slm_or_ok))
+            if slm_or_ok and 'n_iterations' in slm_or_res:
+                slm_oracle_iterations.append(int(slm_or_res['n_iterations']))
 
             em_res = trial.get('em_results', {})
             em_ok = bool(em_res.get('log_likelihood', -np.inf) > -np.inf)
@@ -230,19 +238,23 @@ class PPLSVisualizer:
             if ecm_ok and 'n_iterations' in ecm_res:
                 ecm_iterations.append(int(ecm_res['n_iterations']))
 
+
         # Export convergence comparison table to Excel
         self._export_convergence_table_to_excel(
             slm_iterations,
+            slm_joint_iterations,
             slm_oracle_iterations,
             em_iterations,
             ecm_iterations,
             success_rates={
-                'SLM': float(np.mean(slm_success)) if slm_success else 0.0,
+                'SLM-Fixed': float(np.mean(slm_success)) if slm_success else 0.0,
+                'SLM-Joint': float(np.mean(slm_joint_success)) if slm_joint_success else 0.0,
                 'SLM-Oracle': float(np.mean(slm_oracle_success)) if slm_oracle_success else 0.0,
                 'EM': float(np.mean(em_success)) if em_success else 0.0,
                 'ECM': float(np.mean(ecm_success)) if ecm_success else 0.0,
             },
         )
+
         
     def create_results_summary(self, experiment_results: Dict):
         """
@@ -294,6 +306,7 @@ class PPLSVisualizer:
     def _export_convergence_table_to_excel(
         self,
         slm_iterations: List[int],
+        slm_joint_iterations: List[int],
         slm_oracle_iterations: List[int],
         em_iterations: List[int],
         ecm_iterations: List[int],
@@ -312,39 +325,45 @@ class PPLSVisualizer:
 
         # Calculate statistics for convergence comparison
         convergence_data = {
-            'Algorithm': ['SLM', 'SLM-Oracle', 'EM', 'ECM'],
+            'Algorithm': ['SLM-Fixed', 'SLM-Joint', 'SLM-Oracle', 'EM', 'ECM'],
             'Mean_Iterations': [
                 np.mean(slm_iterations) if slm_iterations else 0,
+                np.mean(slm_joint_iterations) if slm_joint_iterations else 0,
                 np.mean(slm_oracle_iterations) if slm_oracle_iterations else 0,
                 np.mean(em_iterations) if em_iterations else 0,
                 np.mean(ecm_iterations) if ecm_iterations else 0
             ],
             'Std_Iterations': [
                 np.std(slm_iterations) if slm_iterations else 0,
+                np.std(slm_joint_iterations) if slm_joint_iterations else 0,
                 np.std(slm_oracle_iterations) if slm_oracle_iterations else 0,
                 np.std(em_iterations) if em_iterations else 0,
                 np.std(ecm_iterations) if ecm_iterations else 0
             ],
             'Min_Iterations': [
                 np.min(slm_iterations) if slm_iterations else 0,
+                np.min(slm_joint_iterations) if slm_joint_iterations else 0,
                 np.min(slm_oracle_iterations) if slm_oracle_iterations else 0,
                 np.min(em_iterations) if em_iterations else 0,
                 np.min(ecm_iterations) if ecm_iterations else 0
             ],
             'Max_Iterations': [
                 np.max(slm_iterations) if slm_iterations else 0,
+                np.max(slm_joint_iterations) if slm_joint_iterations else 0,
                 np.max(slm_oracle_iterations) if slm_oracle_iterations else 0,
                 np.max(em_iterations) if em_iterations else 0,
                 np.max(ecm_iterations) if ecm_iterations else 0
             ],
             'Median_Iterations': [
                 np.median(slm_iterations) if slm_iterations else 0,
+                np.median(slm_joint_iterations) if slm_joint_iterations else 0,
                 np.median(slm_oracle_iterations) if slm_oracle_iterations else 0,
                 np.median(em_iterations) if em_iterations else 0,
                 np.median(ecm_iterations) if ecm_iterations else 0
             ],
             'Success_Rate': [
-                _sr('SLM'),
+                _sr('SLM-Fixed'),
+                _sr('SLM-Joint'),
                 _sr('SLM-Oracle'),
                 _sr('EM'),
                 _sr('ECM'),
@@ -505,14 +524,89 @@ class LoadingPlotter:
             except Exception:
                 pass
             
-        # Plot with publication-quality styling
+        # Plot with publication-quality styling.
+        # IMPORTANT: make lines distinguishable even in grayscale printing.
+        # We use (color + linestyle + marker shape + thicker linewidths).
         x = np.arange(len(w_true))
-        ax.plot(x, w_true, 'k-', linewidth=2.0, label='Ground Truth', zorder=6)
-        ax.plot(x, w_slm, 'g--', linewidth=1.5, label='SLM', alpha=0.85, zorder=5)
+
+        common = {
+            "markevery": 1,  # p/q are small in our paper setting; show marker at each index.
+            "markersize": 7,
+            "markeredgewidth": 1.2,
+            "alpha": 0.98,
+        }
+
+        ax.plot(
+            x,
+            w_true,
+            color="black",
+            linestyle="-",
+            linewidth=3.2,
+            marker="o",
+            markerfacecolor="black",
+            markeredgecolor="black",
+            label="Ground Truth",
+            zorder=6,
+            **common,
+        )
+        ax.plot(
+            x,
+            w_slm,
+            color="#2E7D32",
+            linestyle="--",
+            linewidth=2.6,
+            marker="s",
+            markerfacecolor="#2E7D32",
+            markeredgecolor="black",
+            label="SLM",
+            zorder=5,
+            **common,
+        )
         if w_oracle is not None:
-            ax.plot(x, w_oracle, color='m', linestyle='-', linewidth=1.5, label='SLM-Oracle', alpha=0.85, zorder=4)
-        ax.plot(x, w_em, 'r:', linewidth=1.5, label='EM', alpha=0.85, zorder=3)
-        ax.plot(x, w_ecm, 'b-.', linewidth=1.5, label='ECM', alpha=0.85, zorder=2)
+            ax.plot(
+                x,
+                w_oracle,
+                color="#6A1B9A",
+                linestyle="-",
+                linewidth=2.4,
+                marker="*",
+                markersize=10,
+                markerfacecolor="#6A1B9A",
+                markeredgecolor="black",
+                label="SLM-Oracle",
+                zorder=4,
+                alpha=0.98,
+                markevery=1,
+                markeredgewidth=1.2,
+            )
+        ax.plot(
+            x,
+            w_em,
+            color="#EF6C00",
+            linestyle=":",
+            linewidth=2.4,
+            marker="^",
+            markerfacecolor="#EF6C00",
+            markeredgecolor="black",
+            label="EM",
+            zorder=3,
+            **common,
+        )
+        ax.plot(
+            x,
+            w_ecm,
+            color="#1565C0",
+            linestyle="-.",
+            linewidth=2.4,
+            marker="D",
+            markerfacecolor="#1565C0",
+            markeredgecolor="black",
+            label="ECM",
+            zorder=2,
+            **common,
+        )
+
+
         
         ax.set_xlabel('Variable Index', fontweight='bold')
         ax.set_ylabel('Loading Value', fontweight='bold')
@@ -589,14 +683,89 @@ class LoadingPlotter:
             except Exception:
                 pass
             
-        # Plot with publication-quality styling
+        # Plot with publication-quality styling.
+        # IMPORTANT: make lines distinguishable even in grayscale printing.
+        # We use (color + linestyle + marker shape + thicker linewidths).
         x = np.arange(len(c_true))
-        ax.plot(x, c_true, 'k-', linewidth=2.0, label='Ground Truth', zorder=6)
-        ax.plot(x, c_slm, 'g--', linewidth=1.5, label='SLM', alpha=0.85, zorder=5)
+
+        common = {
+            "markevery": 1,
+            "markersize": 7,
+            "markeredgewidth": 1.2,
+            "alpha": 0.98,
+        }
+
+        ax.plot(
+            x,
+            c_true,
+            color="black",
+            linestyle="-",
+            linewidth=3.2,
+            marker="o",
+            markerfacecolor="black",
+            markeredgecolor="black",
+            label="Ground Truth",
+            zorder=6,
+            **common,
+        )
+        ax.plot(
+            x,
+            c_slm,
+            color="#2E7D32",
+            linestyle="--",
+            linewidth=2.6,
+            marker="s",
+            markerfacecolor="#2E7D32",
+            markeredgecolor="black",
+            label="SLM",
+            zorder=5,
+            **common,
+        )
         if c_oracle is not None:
-            ax.plot(x, c_oracle, color='m', linestyle='-', linewidth=1.5, label='SLM-Oracle', alpha=0.85, zorder=4)
-        ax.plot(x, c_em, 'r:', linewidth=1.5, label='EM', alpha=0.85, zorder=3)
-        ax.plot(x, c_ecm, 'b-.', linewidth=1.5, label='ECM', alpha=0.85, zorder=2)
+            ax.plot(
+                x,
+                c_oracle,
+                color="#6A1B9A",
+                linestyle="-",
+                linewidth=2.4,
+                marker="*",
+                markersize=10,
+                markerfacecolor="#6A1B9A",
+                markeredgecolor="black",
+                label="SLM-Oracle",
+                zorder=4,
+                alpha=0.98,
+                markevery=1,
+                markeredgewidth=1.2,
+            )
+        ax.plot(
+            x,
+            c_em,
+            color="#EF6C00",
+            linestyle=":",
+            linewidth=2.4,
+            marker="^",
+            markerfacecolor="#EF6C00",
+            markeredgecolor="black",
+            label="EM",
+            zorder=3,
+            **common,
+        )
+        ax.plot(
+            x,
+            c_ecm,
+            color="#1565C0",
+            linestyle="-.",
+            linewidth=2.4,
+            marker="D",
+            markerfacecolor="#1565C0",
+            markeredgecolor="black",
+            label="ECM",
+            zorder=2,
+            **common,
+        )
+
+
         
         ax.set_xlabel('Variable Index', fontweight='bold')
         ax.set_ylabel('Loading Value', fontweight='bold')

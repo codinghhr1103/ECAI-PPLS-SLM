@@ -91,6 +91,10 @@ def _recommend_n_jobs() -> int:
 def _thread_limited_env() -> dict:
     """Return env dict limiting BLAS/OMP threads to 1 to avoid oversubscription."""
     env = dict(os.environ)
+
+    # Ensure real-time logs even when stdout is piped (tee_run uses stdout=PIPE).
+    env["PYTHONUNBUFFERED"] = "1"
+
     for k in (
         "OMP_NUM_THREADS",
         "MKL_NUM_THREADS",
@@ -101,6 +105,7 @@ def _thread_limited_env() -> dict:
     ):
         env[k] = "1"
     return env
+
 
 
 def _tune_montecarlo_config(cfg: dict, n_jobs: int) -> dict:
@@ -212,7 +217,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     parser.add_argument("--skip-speed", action="store_true", help="Skip speed experiment")
     parser.add_argument("--skip-association", action="store_true", help="Skip association application")
     parser.add_argument("--skip-prediction", action="store_true", help="Skip prediction application")
-    parser.add_argument("--skip-noise-ablation", action="store_true", help="Skip noise pre-estimation ablation experiments")
+
     parser.add_argument("--no-sync", action="store_true", help="Do not run scripts/sync_artifacts.py")
 
     parser.add_argument(
@@ -278,17 +283,15 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         run_speed = bool(run_cfg.get("speed", True)) and (not args.skip_speed)
         run_association = bool(run_cfg.get("association", True)) and (not args.skip_association)
         run_prediction = bool(run_cfg.get("prediction", True)) and (not args.skip_prediction)
-        run_noise_ablation = bool(run_cfg.get("noise_ablation", True)) and (not args.skip_noise_ablation)
         run_sync = bool(run_cfg.get("sync_artifacts", True)) and (not args.no_sync)
 
         # App-specific config
         assoc_cfg = exp_cfg.get("association", {})
         pred_cfg = exp_cfg.get("prediction", {})
-        noise_cfg = exp_cfg.get("noise_ablation", {})
 
         assoc_out = args.assoc_out or assoc_cfg.get("output_dir", "results_association")
         pred_out = args.pred_out or pred_cfg.get("output_dir", "results_prediction")
-        noise_out = args.noise_out or noise_cfg.get("output_dir", "output/noise_ablation")
+
 
         # Prefer CLI override; otherwise use config; otherwise fall back to bundled zip if present.
         default_brca_zip = repo_root / "application" / "brca_data_w_subtypes.csv.zip"
@@ -313,7 +316,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
             _rm_tree((repo_root / str(assoc_out)).resolve())
             _rm_tree((repo_root / str(pred_out)).resolve())
-            _rm_tree((repo_root / str(noise_out)).resolve())
+
 
             if args.clean_artifacts:
                 _rm_tree(repo_root / "paper" / "artifacts")
@@ -338,7 +341,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         # 2) Speed experiment
         if run_speed:
             code = tee_run(
-                [sys.executable, "-m", "ppls_slm.benchmarks.speed_experiment"],
+                [sys.executable, "-u", "-m", "ppls_slm.benchmarks.speed_experiment"],
+
                 cwd=repo_root,
                 log_path=logs_dir / "02_speed_experiment.log",
                 env=run_env,
@@ -382,59 +386,12 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                 return code
 
 
-        # 5) Noise pre-estimation ablation (Section 5 theory validation)
-        if run_noise_ablation:
-            # Match the main experiment settings where sensible, but allow ablation-specific overrides.
-            n_starts_default = int(original_config.get("algorithms", {}).get("common", {}).get("n_starts", 32))
-            slm_max_iter_default = int(original_config.get("algorithms", {}).get("slm", {}).get("max_iter", 100))
-            seed = int(original_config.get("experiment", {}).get("random_seed", 42))
 
-            exp2_n_starts = int(noise_cfg.get("exp2_n_starts", n_starts_default))
-            slm_max_iter = int(noise_cfg.get("slm_max_iter", slm_max_iter_default))
-
-            cmd = [
-                sys.executable,
-                "-m",
-                "ppls_slm.cli.noise_preestimation_ablation",
-                "--run",
-                "all",
-                "--output_dir",
-                str(noise_out),
-                "--seed",
-                str(seed),
-                "--exp2_n_starts",
-                str(exp2_n_starts),
-                "--slm_max_iter",
-                str(slm_max_iter),
-            ]
-
-
-            # Optional: allow config.json to override the ablation repetition counts / settings.
-            # This is useful because exp2 (joint optimisation) can be very slow.
-            exp1_M = noise_cfg.get("exp1_M")
-            exp2_M = noise_cfg.get("exp2_M")
-            if exp1_M is not None:
-                cmd += ["--exp1_M", str(int(exp1_M))]
-            if exp2_M is not None:
-                cmd += ["--exp2_M", str(int(exp2_M))]
-
-
-            if bool(noise_cfg.get("fast", False)):
-                cmd += ["--fast"]
-
-            for k in ("exp2_p", "exp2_q", "exp2_r", "exp2_N", "exp2_optimizer", "exp2_gtol", "exp2_xtol", "exp2_barrier_tol"):
-                if k in noise_cfg and noise_cfg.get(k) is not None:
-                    cmd += [f"--{k}", str(noise_cfg.get(k))]
-
-
-
-            code = tee_run(cmd, cwd=repo_root, log_path=logs_dir / "05_noise_ablation.log", env=run_env)
-            if code != 0:
-                return code
 
         # 6) Sync artifacts
         if run_sync:
-            code = tee_run([sys.executable, "scripts/sync_artifacts.py"], cwd=repo_root, log_path=logs_dir / "06_sync_artifacts.log", env=run_env)
+            code = tee_run([sys.executable, "-u", "scripts/sync_artifacts.py"], cwd=repo_root, log_path=logs_dir / "06_sync_artifacts.log", env=run_env)
+
 
             if code != 0:
                 return code

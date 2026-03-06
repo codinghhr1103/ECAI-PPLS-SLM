@@ -62,8 +62,10 @@ import os
 import time
 from datetime import datetime
 import warnings
+import traceback
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, as_completed
+
 
 
 _WORKER_CTX: Dict[str, Any] = {}
@@ -112,13 +114,33 @@ def _run_trial_worker(trial_id: int, X: np.ndarray, Y: np.ndarray, seed: int) ->
         save_intermediate = bool(ctx.get("save_intermediate", True))
 
         # Instantiate algorithms inside the process.
-        slm = ScalarLikelihoodMethod(
+        slm_fixed = ScalarLikelihoodMethod(
             p=p,
             q=q,
             r=r,
             optimizer=config["algorithms"]["slm"]["optimizer"],
             max_iter=config["algorithms"]["slm"]["max_iter"],
             use_noise_preestimation=config["algorithms"]["slm"]["use_noise_preestimation"],
+            gtol=config["algorithms"]["slm"].get("gtol", 1e-3),
+            xtol=config["algorithms"]["slm"].get("xtol", 1e-3),
+            barrier_tol=config["algorithms"]["slm"].get("barrier_tol", 1e-3),
+            constraint_slack=config["algorithms"]["slm"].get("constraint_slack", 1e-2),
+        )
+
+        # Joint-noise variant: include (sigma_e^2, sigma_f^2) in the optimisation vector.
+        slm_joint_cfg = config.get("algorithms", {}).get("slm_joint", {})
+        slm_joint = ScalarLikelihoodMethod(
+            p=p,
+            q=q,
+            r=r,
+            optimizer=str(slm_joint_cfg.get("optimizer", config["algorithms"]["slm"]["optimizer"])),
+            max_iter=int(slm_joint_cfg.get("max_iter", config["algorithms"]["slm"]["max_iter"])),
+            use_noise_preestimation=bool(slm_joint_cfg.get("use_noise_preestimation", True)),
+            optimize_noise_variances=True,
+            gtol=float(slm_joint_cfg.get("gtol", config["algorithms"]["slm"].get("gtol", 1e-3))),
+            xtol=float(slm_joint_cfg.get("xtol", config["algorithms"]["slm"].get("xtol", 1e-3))),
+            barrier_tol=float(slm_joint_cfg.get("barrier_tol", config["algorithms"]["slm"].get("barrier_tol", 1e-3))),
+            constraint_slack=float(slm_joint_cfg.get("constraint_slack", config["algorithms"]["slm"].get("constraint_slack", 1e-2))),
         )
 
         # Oracle-noise variant: skip closed-form noise pre-estimation and use true (sigma_e^2, sigma_f^2).
@@ -140,6 +162,7 @@ def _run_trial_worker(trial_id: int, X: np.ndarray, Y: np.ndarray, seed: int) ->
 
 
         em = EMAlgorithm(
+
             p=p,
             q=q,
             r=r,
@@ -157,12 +180,31 @@ def _run_trial_worker(trial_id: int, X: np.ndarray, Y: np.ndarray, seed: int) ->
 
         # Run algorithms and collect timing.
         slm_start_time = time.time()
-        slm_results = slm.fit(X, Y, starting_points)
+        slm_fixed_results = slm_fixed.fit(X, Y, starting_points)
         slm_time = time.time() - slm_start_time
+
+        # Warm-start joint optimisation from the fixed-noise solution (feasible W/C).
+        theta0_warm = np.concatenate([
+            slm_fixed_results["W"].flatten(),
+            slm_fixed_results["C"].flatten(),
+            np.diag(slm_fixed_results["Sigma_t"]),
+            np.diag(slm_fixed_results["B"]),
+            [
+                float(slm_fixed_results["sigma_h2"]),
+                float(slm_fixed_results["sigma_e2"]),
+                float(slm_fixed_results["sigma_f2"]),
+            ],
+        ])
+        starting_points_joint = [theta0_warm] + list(starting_points)
+
+        slm_joint_start_time = time.time()
+        slm_joint_results = slm_joint.fit(X, Y, starting_points_joint)
+        slm_joint_time = time.time() - slm_joint_start_time
 
         slm_oracle_start_time = time.time()
         slm_oracle_results = slm_oracle.fit(X, Y, starting_points)
         slm_oracle_time = time.time() - slm_oracle_start_time
+
 
         em_start_time = time.time()
         em_results = em.fit(X, Y, starting_points)
@@ -172,31 +214,50 @@ def _run_trial_worker(trial_id: int, X: np.ndarray, Y: np.ndarray, seed: int) ->
         ecm_results = ecm.fit(X, Y, starting_points)
         ecm_time = time.time() - ecm_start_time
 
-        slm_converged = 1 if slm_results.get("success", False) else 0
+        slm_converged = 1 if slm_fixed_results.get("success", False) else 0
+        slm_joint_converged = 1 if slm_joint_results.get("success", False) else 0
         slm_oracle_converged = 1 if slm_oracle_results.get("success", False) else 0
+
         em_converged = 1 if em_results.get("log_likelihood", -np.inf) > -np.inf else 0
         ecm_converged = 1 if ecm_results.get("log_likelihood", -np.inf) > -np.inf else 0
 
 
         stats_summary = {
             "trial_id": trial_id,
+            # Backward-compatible key: treat "slm" as the fixed-noise variant.
             "slm": {
                 "runtime": slm_time,
                 "avg_time_per_start": slm_time / len(starting_points),
                 "converged": slm_converged,
                 "failed": 1 - slm_converged,
                 "convergence_rate": float(slm_converged),
-                "best_objective": slm_results.get("objective_value", np.inf),
-                "avg_iterations": slm_results.get("n_iterations", 0),
+                "best_objective": slm_fixed_results.get("objective_value", np.inf),
+                "avg_iterations": slm_fixed_results.get("n_iterations", 0),
             },
-
+            "slm_fixed": {
+                "runtime": slm_time,
+                "avg_time_per_start": slm_time / len(starting_points),
+                "converged": slm_converged,
+                "failed": 1 - slm_converged,
+                "convergence_rate": float(slm_converged),
+                "best_objective": slm_fixed_results.get("objective_value", np.inf),
+                "avg_iterations": slm_fixed_results.get("n_iterations", 0),
+            },
+            "slm_joint": {
+                "runtime": slm_joint_time,
+                "avg_time_per_start": slm_joint_time / len(starting_points_joint),
+                "converged": slm_joint_converged,
+                "failed": 1 - slm_joint_converged,
+                "convergence_rate": float(slm_joint_converged),
+                "best_objective": slm_joint_results.get("objective_value", np.inf),
+                "avg_iterations": slm_joint_results.get("n_iterations", 0),
+            },
             "slm_oracle": {
                 "runtime": slm_oracle_time,
                 "avg_time_per_start": slm_oracle_time / len(starting_points),
                 "converged": slm_oracle_converged,
                 "failed": 1 - slm_oracle_converged,
                 "convergence_rate": float(slm_oracle_converged),
-
                 "best_objective": slm_oracle_results.get("objective_value", np.inf),
                 "avg_iterations": slm_oracle_results.get("n_iterations", 0),
             },
@@ -206,7 +267,6 @@ def _run_trial_worker(trial_id: int, X: np.ndarray, Y: np.ndarray, seed: int) ->
                 "converged": em_converged,
                 "failed": 1 - em_converged,
                 "convergence_rate": float(em_converged),
-
                 "best_likelihood": em_results.get("log_likelihood", -np.inf),
                 "avg_iterations": em_results.get("n_iterations", 0),
             },
@@ -216,7 +276,6 @@ def _run_trial_worker(trial_id: int, X: np.ndarray, Y: np.ndarray, seed: int) ->
                 "converged": ecm_converged,
                 "failed": 1 - ecm_converged,
                 "convergence_rate": float(ecm_converged),
-
                 "best_likelihood": ecm_results.get("log_likelihood", -np.inf),
                 "avg_iterations": ecm_results.get("n_iterations", 0),
             },
@@ -231,13 +290,17 @@ def _run_trial_worker(trial_id: int, X: np.ndarray, Y: np.ndarray, seed: int) ->
         return {
             "trial_id": trial_id,
             "true_params": true_params,
-            "slm_results": slm_results,
+            # Backward-compatible key: keep the original name used throughout the codebase.
+            "slm_results": slm_fixed_results,
+            "slm_joint_results": slm_joint_results,
             "slm_oracle_results": slm_oracle_results,
             "em_results": em_results,
             "ecm_results": ecm_results,
             "data_shape": {"X": X.shape, "Y": Y.shape},
             "statistics": stats_summary,
         }
+
+
 
 
     except Exception as e:
@@ -343,7 +406,8 @@ class PPLSExperiment:
         print(f"Model dimensions: p={self.p}, q={self.q}, r={self.r}")
         print(f"Sample size: {self.n_samples}")
         print(f"Starting points per algorithm: {self.n_starts}")
-        print(f"Algorithms: SLM, SLM-Oracle, EM, ECM")
+        print(f"Algorithms: SLM-fixed, SLM-joint, SLM-Oracle, EM, ECM")
+
 
         print(f"Ground truth: Fixed for all trials")
         print(f"{'='*60}\n")
@@ -450,16 +514,20 @@ class PPLSExperiment:
         # Add runtime statistics summary if available
         if valid_results and 'statistics' in valid_results[0]:
             total_slm_runtime = sum(r['statistics']['slm']['runtime'] for r in valid_results)
+            total_slm_joint_runtime = sum(r['statistics'].get('slm_joint', {}).get('runtime', 0.0) for r in valid_results)
             total_em_runtime = sum(r['statistics']['em']['runtime'] for r in valid_results)
             total_ecm_runtime = sum(r['statistics']['ecm']['runtime'] for r in valid_results)
             avg_slm_convergence = np.mean([r['statistics']['slm']['convergence_rate'] for r in valid_results])
+            avg_slm_joint_convergence = np.mean([r['statistics'].get('slm_joint', {}).get('convergence_rate', 0.0) for r in valid_results])
             avg_em_convergence = np.mean([r['statistics']['em']['convergence_rate'] for r in valid_results])
             avg_ecm_convergence = np.mean([r['statistics']['ecm']['convergence_rate'] for r in valid_results])
             
             print(f"\nAlgorithm Performance Summary:")
-            print(f"  SLM: {total_slm_runtime:.1f}s total, {avg_slm_convergence*100:.1f}% convergence")
-            print(f"  EM:  {total_em_runtime:.1f}s total, {avg_em_convergence*100:.1f}% convergence")
-            print(f"  ECM: {total_ecm_runtime:.1f}s total, {avg_ecm_convergence*100:.1f}% convergence")
+            print(f"  SLM-fixed: {total_slm_runtime:.1f}s total, {avg_slm_convergence*100:.1f}% convergence")
+            print(f"  SLM-joint: {total_slm_joint_runtime:.1f}s total, {avg_slm_joint_convergence*100:.1f}% convergence")
+            print(f"  EM:        {total_em_runtime:.1f}s total, {avg_em_convergence*100:.1f}% convergence")
+            print(f"  ECM:       {total_ecm_runtime:.1f}s total, {avg_ecm_convergence*100:.1f}% convergence")
+
         
         print(f"{'='*60}\n")
         
@@ -524,12 +592,14 @@ class PPLSExperiment:
                 'trial_id': trial_id,
                 'true_params': true_params,
                 'slm_results': comparison_results['slm'],
+                'slm_joint_results': comparison_results['slm_joint'],
                 'slm_oracle_results': comparison_results['slm_oracle'],
                 'em_results': comparison_results['em'],
                 'ecm_results': comparison_results['ecm'],
                 'data_shape': {'X': X.shape, 'Y': Y.shape},
                 'statistics': comparison_results.get('statistics', {})
             }
+
 
             
             return trial_result
@@ -543,8 +613,10 @@ class PPLSExperiment:
                 'trial_id': trial_id,
                 'error_type': type(e).__name__,
                 'error_message': str(e),
+                'traceback': traceback.format_exc(),
                 'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             }
+
             
             error_file = os.path.join(self.results_dir, f"trial_{trial_id:03d}_error.json")
             try:
@@ -578,7 +650,7 @@ class PPLSExperiment:
             Results from all three algorithms
         """
         # Initialize algorithms
-        slm = ScalarLikelihoodMethod(
+        slm_fixed = ScalarLikelihoodMethod(
             p=self.p, q=self.q, r=self.r,
             optimizer=self.config['algorithms']['slm']['optimizer'],
             max_iter=self.config['algorithms']['slm']['max_iter'],
@@ -589,6 +661,18 @@ class PPLSExperiment:
             constraint_slack=self.config['algorithms']['slm'].get('constraint_slack', 1e-2),
         )
 
+        slm_joint_cfg = self.config.get('algorithms', {}).get('slm_joint', {})
+        slm_joint = ScalarLikelihoodMethod(
+            p=self.p, q=self.q, r=self.r,
+            optimizer=str(slm_joint_cfg.get('optimizer', self.config['algorithms']['slm']['optimizer'])),
+            max_iter=int(slm_joint_cfg.get('max_iter', self.config['algorithms']['slm']['max_iter'])),
+            use_noise_preestimation=bool(slm_joint_cfg.get('use_noise_preestimation', True)),
+            optimize_noise_variances=True,
+            gtol=float(slm_joint_cfg.get('gtol', self.config['algorithms']['slm'].get('gtol', 1e-3))),
+            xtol=float(slm_joint_cfg.get('xtol', self.config['algorithms']['slm'].get('xtol', 1e-3))),
+            barrier_tol=float(slm_joint_cfg.get('barrier_tol', self.config['algorithms']['slm'].get('barrier_tol', 1e-3))),
+            constraint_slack=float(slm_joint_cfg.get('constraint_slack', self.config['algorithms']['slm'].get('constraint_slack', 1e-2))),
+        )
 
         # Oracle-noise variant: same optimiser/settings as SLM, but uses true (sigma_e^2, sigma_f^2).
         slm_oracle = ScalarLikelihoodMethod(
@@ -603,6 +687,7 @@ class PPLSExperiment:
             barrier_tol=self.config['algorithms']['slm'].get('barrier_tol', 1e-3),
             constraint_slack=self.config['algorithms']['slm'].get('constraint_slack', 1e-2),
         )
+
 
 
         
@@ -623,17 +708,39 @@ class PPLSExperiment:
         print(f"Trial {trial_id+1}: Algorithm Comparison")
         print(f"{'='*60}")
         
-        # Run SLM first
-        print(f"Running SLM with {len(starting_points)} starting points...")
+        # Run SLM-fixed first
+        print(f"Running SLM-fixed with {len(starting_points)} starting points...")
         slm_start_time = time.time()
         slm_results, slm_stats = self._run_algorithm_with_stats(
-            slm, X, Y, starting_points, trial_id, "SLM"
+            slm_fixed, X, Y, starting_points, trial_id, "SLM-fixed"
         )
         slm_time = time.time() - slm_start_time
-        
-        print(f"SLM completed: {slm_time:.2f}s, convergence: {slm_stats['convergence_rate']*100:.1f}%")
 
-        # Run SLM-Oracle (oracle noise) second
+        print(f"SLM-fixed completed: {slm_time:.2f}s, convergence: {slm_stats['convergence_rate']*100:.1f}%")
+
+        # Run SLM-joint second (warm-started from the fixed solution)
+        theta0_warm = np.concatenate([
+            slm_results['W'].flatten(),
+            slm_results['C'].flatten(),
+            np.diag(slm_results['Sigma_t']),
+            np.diag(slm_results['B']),
+            [float(slm_results['sigma_h2']), float(slm_results['sigma_e2']), float(slm_results['sigma_f2'])],
+        ])
+        starting_points_joint = [theta0_warm] + list(starting_points)
+
+        print(f"Running SLM-joint with {len(starting_points_joint)} starting points...")
+        slm_joint_start_time = time.time()
+        slm_joint_results, slm_joint_stats = self._run_algorithm_with_stats(
+            slm_joint, X, Y, starting_points_joint, trial_id, "SLM-joint"
+        )
+        slm_joint_time = time.time() - slm_joint_start_time
+
+        print(
+            f"SLM-joint completed: {slm_joint_time:.2f}s, "
+            f"convergence: {slm_joint_stats['convergence_rate']*100:.1f}%"
+        )
+
+        # Run SLM-Oracle (oracle noise) third
         print(f"Running SLM-Oracle with {len(starting_points)} starting points...")
         slm_oracle_start_time = time.time()
         slm_oracle_results, slm_oracle_stats = self._run_algorithm_with_stats(
@@ -645,6 +752,7 @@ class PPLSExperiment:
             f"SLM-Oracle completed: {slm_oracle_time:.2f}s, "
             f"convergence: {slm_oracle_stats['convergence_rate']*100:.1f}%"
         )
+
         
         # Run EM third
 
@@ -672,6 +780,7 @@ class PPLSExperiment:
         # Compile statistics
         stats_summary = {
             'trial_id': trial_id,
+            # Backward-compatible key: treat 'slm' as the fixed-noise variant.
             'slm': {
                 'runtime': slm_time,
                 'avg_time_per_start': slm_time/len(starting_points),
@@ -680,6 +789,24 @@ class PPLSExperiment:
                 'convergence_rate': slm_stats['converged']/len(starting_points),
                 'best_objective': slm_stats['best_objective'],
                 'avg_iterations': slm_stats['avg_iterations']
+            },
+            'slm_fixed': {
+                'runtime': slm_time,
+                'avg_time_per_start': slm_time/len(starting_points),
+                'converged': slm_stats['converged'],
+                'failed': slm_stats['failed'],
+                'convergence_rate': slm_stats['converged']/len(starting_points),
+                'best_objective': slm_stats['best_objective'],
+                'avg_iterations': slm_stats['avg_iterations']
+            },
+            'slm_joint': {
+                'runtime': slm_joint_time,
+                'avg_time_per_start': slm_joint_time/len(starting_points_joint),
+                'converged': slm_joint_stats['converged'],
+                'failed': slm_joint_stats['failed'],
+                'convergence_rate': slm_joint_stats['converged']/len(starting_points_joint),
+                'best_objective': slm_joint_stats['best_objective'],
+                'avg_iterations': slm_joint_stats['avg_iterations']
             },
             'slm_oracle': {
                 'runtime': slm_oracle_time,
@@ -712,6 +839,7 @@ class PPLSExperiment:
             }
         }
 
+
         
         # Save per-trial statistics (optional)
         if self.config.get('output', {}).get('save_intermediate', True):
@@ -721,12 +849,15 @@ class PPLSExperiment:
 
         
         return {
+            # Backward-compatible key: treat 'slm' as the fixed-noise variant.
             'slm': slm_results,
+            'slm_joint': slm_joint_results,
             'slm_oracle': slm_oracle_results,
             'em': em_results,
             'ecm': ecm_results,
             'statistics': stats_summary
         }
+
 
         
     def _run_algorithm_with_stats(self, algorithm, X: np.ndarray, Y: np.ndarray,
@@ -759,7 +890,8 @@ class PPLSExperiment:
         results = algorithm.fit(X, Y, starting_points)
         
         # Compile basic statistics
-        if algorithm_name in ("SLM", "SLM-Oracle"):
+        if algorithm_name in ("SLM", "SLM-fixed", "SLM-joint", "SLM-Oracle"):
+
             stats = {
                 'converged': 1 if results.get('success', False) else 0,
                 'failed': 0 if results.get('success', False) else 1,
@@ -795,15 +927,18 @@ class PPLSExperiment:
         """
         # Initialize metrics calculators
         slm_metrics_list = []
+        slm_joint_metrics_list = []
         slm_oracle_metrics_list = []
         em_metrics_list = []
         ecm_metrics_list = []
         
         # Collect runtime statistics
         slm_runtime_stats = []
+        slm_joint_runtime_stats = []
         slm_oracle_runtime_stats = []
         em_runtime_stats = []
         ecm_runtime_stats = []
+
 
         
         # Collect metrics for each trial
@@ -811,14 +946,20 @@ class PPLSExperiment:
             # Create performance metric calculator
             metrics_calc = PerformanceMetrics(trial['true_params'])
             
-            # Compute metrics for SLM
+            # Compute metrics for SLM-fixed
             slm_metrics = metrics_calc.compute_mse(trial['slm_results'])
             slm_metrics_list.append(slm_metrics)
+
+            # Compute metrics for SLM-joint
+            if 'slm_joint_results' in trial:
+                slm_joint_metrics = metrics_calc.compute_mse(trial['slm_joint_results'])
+                slm_joint_metrics_list.append(slm_joint_metrics)
             
             # Compute metrics for SLM-Oracle
             if 'slm_oracle_results' in trial:
                 slm_oracle_metrics = metrics_calc.compute_mse(trial['slm_oracle_results'])
                 slm_oracle_metrics_list.append(slm_oracle_metrics)
+
 
             # Compute metrics for EM
             em_metrics = metrics_calc.compute_mse(trial['em_results'])
@@ -831,20 +972,25 @@ class PPLSExperiment:
             # Collect runtime statistics if available
             if 'statistics' in trial:
                 slm_runtime_stats.append(trial['statistics']['slm'])
+                if 'slm_joint' in trial['statistics']:
+                    slm_joint_runtime_stats.append(trial['statistics']['slm_joint'])
                 if 'slm_oracle' in trial['statistics']:
                     slm_oracle_runtime_stats.append(trial['statistics']['slm_oracle'])
                 em_runtime_stats.append(trial['statistics']['em'])
                 ecm_runtime_stats.append(trial['statistics']['ecm'])
 
+
         
         # Aggregate metrics
         analysis = {
             'slm': self._aggregate_metrics(slm_metrics_list),
+            'slm_joint': self._aggregate_metrics(slm_joint_metrics_list),
             'slm_oracle': self._aggregate_metrics(slm_oracle_metrics_list),
             'em': self._aggregate_metrics(em_metrics_list),
             'ecm': self._aggregate_metrics(ecm_metrics_list),
             'comparison': self._compare_methods(slm_metrics_list, em_metrics_list, ecm_metrics_list)
         }
+
 
         
         # Add runtime statistics
@@ -860,11 +1006,18 @@ class PPLSExperiment:
                 }
             }
 
+            if slm_joint_runtime_stats:
+                runtime_statistics['slm_joint'] = self._aggregate_runtime_stats(slm_joint_runtime_stats)
+                runtime_statistics['overall']['total_runtime_slm_joint'] = sum(
+                    s['runtime'] for s in slm_joint_runtime_stats
+                )
+
             if slm_oracle_runtime_stats:
                 runtime_statistics['slm_oracle'] = self._aggregate_runtime_stats(slm_oracle_runtime_stats)
                 runtime_statistics['overall']['total_runtime_slm_oracle'] = sum(
                     s['runtime'] for s in slm_oracle_runtime_stats
                 )
+
 
             analysis['runtime_statistics'] = runtime_statistics
 
@@ -1051,8 +1204,19 @@ class PerformanceMetrics:
         mse_dict['mse_sigma_h2'] = (
             aligned_params['sigma_h2'] - self.true_params['sigma_h2']
         )**2
+
+        # Also track noise variances when present (all our algorithms return them).
+        if 'sigma_e2' in aligned_params and 'sigma_e2' in self.true_params:
+            mse_dict['mse_sigma_e2'] = (
+                float(aligned_params['sigma_e2']) - float(self.true_params['sigma_e2'])
+            )**2
+        if 'sigma_f2' in aligned_params and 'sigma_f2' in self.true_params:
+            mse_dict['mse_sigma_f2'] = (
+                float(aligned_params['sigma_f2']) - float(self.true_params['sigma_f2'])
+            )**2
         
         return mse_dict
+
         
     def generate_summary_table(self, slm_metrics_list: List[Dict],
                              em_metrics_list: List[Dict],

@@ -185,6 +185,15 @@ def load_configuration(config_path: str) -> Dict:
                 'max_iter': 1000,
                 'use_noise_preestimation': True
             },
+            'slm_joint': {
+                'optimizer': 'trust-constr',
+                'max_iter': 1000,
+                'use_noise_preestimation': True,
+                'gtol': 1e-3,
+                'xtol': 1e-3,
+                'barrier_tol': 1e-3,
+                'constraint_slack': 1e-2
+            },
             'em': {
                 'max_iter': 1000,
                 'tolerance': 1e-6
@@ -412,8 +421,10 @@ def run_parameter_estimation_stage(config: Dict, base_dir: str) -> bool:
 
     def _extract_mse_table_from_results(experiment_results: Dict) -> Dict:
         analysis = experiment_results.get('analysis', {})
-        params = ['W', 'C', 'B', 'Sigma_t', 'sigma_h2']
-        methods = ['slm', 'slm_oracle', 'em', 'ecm']
+        params = ['W', 'C', 'B', 'Sigma_t', 'sigma_h2', 'sigma_e2', 'sigma_f2']
+
+        methods = ['slm', 'slm_joint', 'slm_oracle', 'em', 'ecm']
+
 
 
         table = {}
@@ -568,7 +579,8 @@ def run_parameter_estimation_stage(config: Dict, base_dir: str) -> bool:
 
         # Add parameter estimation quality
         if 'analysis' in results:
-            for method in ['slm', 'slm_oracle', 'em', 'ecm']:
+            for method in ['slm', 'slm_joint', 'slm_oracle', 'em', 'ecm']:
+
 
                 if method in results['analysis']:
                     method_quality = {}

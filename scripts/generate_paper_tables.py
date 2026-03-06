@@ -94,8 +94,10 @@ def generate_convergence_table(*, artifacts_dir: Path, out_path: Path) -> None:
     if missing:
         raise ValueError(f"Unexpected convergence sheet columns; missing={sorted(missing)}")
 
-    # Normalise algorithm names to match paper.
-    order = ["SLM", "SLM-Oracle", "EM", "ECM"]
+    # Normalise algorithm names to match current Monte Carlo outputs.
+    # (We now report SLM-Fixed / SLM-Joint / SLM-Oracle explicitly.)
+    order = ["SLM-Fixed", "SLM-Joint", "SLM-Oracle", "EM", "ECM"]
+
 
     df = df.copy()
     df["Algorithm"] = df["Algorithm"].astype(str)
@@ -164,11 +166,13 @@ def generate_parameter_mse_table(*, artifacts_dir: Path, out_path: Path) -> None
     high = _read_json(artifacts_dir / "simulation" / "mse_table_high.json")
 
     methods = [
-        ("slm", "SLM"),
+        ("slm", "SLM-Fixed"),
+        ("slm_joint", "SLM-Joint"),
         ("slm_oracle", "SLM-Oracle"),
         ("em", "EM"),
         ("ecm", "ECM"),
     ]
+
 
     keys = [
         ("W", r"$\text{MSE}_W$"),
@@ -553,7 +557,9 @@ def generate_paper_metrics(*, artifacts_dir: Path, out_path: Path) -> None:
             raise ValueError(f"Algorithm '{alg}' not found in {xlsx}")
         return sub.iloc[0]
 
-    r_slm = _get_row("SLM")
+    # Keep macro names stable in LaTeX, but source values from the fixed-noise SLM row.
+    r_slm = _get_row("SLM-Fixed")
+
     r_em = _get_row("EM")
     r_ecm = _get_row("ECM")
 
@@ -679,8 +685,7 @@ def main() -> None:
     generate_detection_table(artifacts_dir=artifacts_dir, out_path=out_dir / "tab_detected_pairs.tex")
     generate_prediction_coverage_table(artifacts_dir=artifacts_dir, out_path=out_dir / "tab_prediction_coverage.tex")
 
-    generate_noise_ablation_exp1_table(artifacts_dir=artifacts_dir, out_path=out_dir / "tab_noise_ablation_exp1.tex")
-    generate_noise_ablation_exp2_table(artifacts_dir=artifacts_dir, out_path=out_dir / "tab_noise_ablation_exp2.tex")
+
 
 
     generate_paper_metrics(artifacts_dir=artifacts_dir, out_path=paper_dir / "generated" / "metrics.tex")
