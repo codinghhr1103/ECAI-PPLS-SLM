@@ -1,29 +1,36 @@
-"""
-Application 2: Prediction with Uncertainty Quantification
-==========================================================
+"""Application 2: Prediction with Uncertainty Quantification (Section 8.3)
 
-Reproduces the prediction experiment from Section 8.3 of the paper
+This module reproduces and extends the prediction experiments from the paper
 "Scalar Likelihood Method for Probabilistic Partial Least Squares Model with Rank n Update".
 
-This application:
-1. Generates synthetic PPLS data  (p = q = 200, r = 50, N = 100).
-2. Runs 5-fold cross-validation.
-3. On each test fold, predicts Y_new | X_new using the conditional Gaussian
-   distribution (Property 1 in the paper):
-       E[y | x] = C B Σ_t W' (W Σ_t W' + σ_e² I)^{-1} x
-       Cov[y|x] = C(B² Σ_t + σ_h² I)C' + σ_f² I
-                  - C B Σ_t W' (W Σ_t W' + σ_e² I)^{-1} W Σ_t B C'
-4. Constructs symmetric credible intervals at levels α ∈ {0.05, 0.10, 0.15, 0.20, 0.25}
-   (Algorithm 3 in the paper).
-5. Reports the empirical coverage rates and compares them with the nominal
-   (1 - α) targets, verifying well-calibrated uncertainty.
+Two experiment tracks are supported:
+
+A) Synthetic PPLS data (paper's main prediction sandbox)
+   - p=q=200, r=50, N=100 (defaults)
+   - 5-fold CV
+   - Compare predictive accuracy across four methods:
+        * PPLS-SLM (fitted per fold)
+        * PPLS-EM  (fitted per fold)
+        * Classical PLS regression (PLSR)
+        * Ridge regression (RidgeCV)
+   - For PPLS-SLM and PPLS-EM, additionally evaluate calibration of credible intervals.
+
+B) (Implemented in separate scripts) Real BRCA TCGA data prediction and calibration.
+
+Evaluation protocol
+-------------------
+- All methods use the same CV folds (fixed RNG seed) and the same standardisation flow:
+  per fold, fit a z-score transform on the training split and apply it to the test split.
+- Accuracy metrics are evaluated on the original Y scale:
+    MSE, MAE, and mean R2 across output dimensions.
+- PPLS credible intervals are constructed element-wise using the predictive covariance.
 
 Usage
 -----
-    python application_prediction.py [--options]
+    python -m ppls_slm.apps.prediction --output_dir results_prediction
 
-Main options
-------------
+Common options
+--------------
   --p INT         Dimension of x            (default: 200)
   --q INT         Dimension of y            (default: 200)
   --r INT         Latent dimension          (default: 50)
@@ -34,10 +41,18 @@ Main options
   --output_dir    Directory for results     (default: results_prediction)
   --plot          Generate calibration plot (flag)
 
-Dependencies
-------------
-Requires ppls_model.py and algorithms.py in the same directory.
+PPLS algorithm options
+----------------------
+  --slm_max_iter INT    SLM max iterations (default: 100)
+  --em_max_iter INT     EM max iterations  (default: 200)
+  --em_tol FLOAT        EM relative tolerance (default: 1e-4)
+
+Baseline options
+----------------
+  --no_baselines         Skip PLSR/Ridge baselines
 """
+
+from __future__ import annotations
 
 import argparse
 import os
@@ -48,8 +63,8 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
-# ── project imports ──────────────────────────────────────────────────────────
-from ppls_slm.algorithms import InitialPointGenerator, ScalarLikelihoodMethod
+from ppls_slm.algorithms import EMAlgorithm, InitialPointGenerator, ScalarLikelihoodMethod
+from ppls_slm.apps.prediction_baselines import compute_regression_metrics, run_plsr_prediction, run_ridge_prediction
 from ppls_slm.ppls_model import PPLSModel
 
 
@@ -57,23 +72,17 @@ from ppls_slm.ppls_model import PPLSModel
 #  Data generation
 # ─────────────────────────────────────────────────────────────────────────────
 
-def generate_ppls_data(p: int = 200,
-                       q: int = 200,
-                       r: int = 50,
-                       n_samples: int = 100,
-                       sigma_e2: float = 0.1,
-                       sigma_f2: float = 0.1,
-                       sigma_h2: float = 0.05,
-                       seed: int = 42) -> Tuple[np.ndarray, np.ndarray, Dict]:
-    """
-    Generate synthetic PPLS data for the prediction experiment.
-
-    Returns
-    -------
-    X : ndarray (N, p)
-    Y : ndarray (N, q)
-    true_params : dict with W, C, B, Sigma_t, sigma_e2, sigma_f2, sigma_h2
-    """
+def generate_ppls_data(
+    p: int = 200,
+    q: int = 200,
+    r: int = 50,
+    n_samples: int = 100,
+    sigma_e2: float = 0.1,
+    sigma_f2: float = 0.1,
+    sigma_h2: float = 0.05,
+    seed: int = 42,
+) -> Tuple[np.ndarray, np.ndarray, Dict]:
+    """Generate synthetic PPLS data for the prediction experiment."""
     rng = np.random.RandomState(seed)
 
     # Random orthonormal loading matrices
@@ -82,253 +91,235 @@ def generate_ppls_data(p: int = 200,
 
     # Decreasing signals so identifiability holds: theta_t2[i] * b[i] decreasing
     theta_t2 = np.linspace(1.5, 0.3, r)
-    b        = np.linspace(2.0, 0.5, r)
-    # Verify: sort by product descending, already done via linspace
+    b = np.linspace(2.0, 0.5, r)
     assert np.all(np.diff(theta_t2 * b) < 0), "Identifiability violated."
 
-    B       = np.diag(b)
+    B = np.diag(b)
     Sigma_t = np.diag(theta_t2)
 
     model = PPLSModel(p, q, r)
-    np.random.seed(seed + 1)   # reproducible sampling
+    np.random.seed(seed + 1)  # reproducible sampling
     X, Y = model.sample(n_samples, W, C, B, Sigma_t, sigma_e2, sigma_f2, sigma_h2)
 
     true_params = {
-        "W": W, "C": C, "B": B, "Sigma_t": Sigma_t,
-        "sigma_e2": sigma_e2, "sigma_f2": sigma_f2, "sigma_h2": sigma_h2,
+        "W": W,
+        "C": C,
+        "B": B,
+        "Sigma_t": Sigma_t,
+        "sigma_e2": sigma_e2,
+        "sigma_f2": sigma_f2,
+        "sigma_h2": sigma_h2,
     }
     return X, Y, true_params
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Prediction helpers  (Property 1 / Algorithm 3 in the paper)
+#  Prediction helpers (Property 1 / Algorithm 3)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def predict_conditional_mean(x_new: np.ndarray,
-                              params: Dict) -> np.ndarray:
-    """
-    Compute E[y_new | x_new, params] via the conditional Gaussian formula:
+def predict_conditional_mean(x_new: np.ndarray, params: Dict) -> np.ndarray:
+    """Compute E[y_new | x_new, params] via the conditional Gaussian formula."""
+    W, C, B = params["W"], params["C"], params["B"]
+    Sigma_t = params["Sigma_t"]
+    sigma_e2 = float(params["sigma_e2"])
 
-        E[y | x] = C B Σ_t W' Σ_xx^{-1} x
-    where  Σ_xx = W Σ_t W' + σ_e² I.
-
-    Parameters
-    ----------
-    x_new    : (q,) or (N_test, p) row vector(s) of new observations
-    params   : dict with W, C, B, Sigma_t, sigma_e2, sigma_f2, sigma_h2
-
-    Returns
-    -------
-    y_pred   : (..., q) predicted means
-    """
-    W, C, B    = params["W"], params["C"], params["B"]
-    Sigma_t    = params["Sigma_t"]
-    sigma_e2   = params["sigma_e2"]
-
-    # Σ_xx = W Σ_t W' + σ_e² I
     Sigma_xx = W @ Sigma_t @ W.T + sigma_e2 * np.eye(W.shape[0])
 
-    # Regression coefficient  A = C B Σ_t W' Σ_xx^{-1}
-    # Computed via Cholesky for numerical stability
     L = np.linalg.cholesky(Sigma_xx + 1e-9 * np.eye(Sigma_xx.shape[0]))
-    # Solve Σ_xx^{-1} W  → shape (p, r)
-    tmp = np.linalg.solve(L, W)                   # L^{-1} W
-    tmp = np.linalg.solve(L.T, tmp)               # Σ_xx^{-1} W
+    tmp = np.linalg.solve(L, W)
+    tmp = np.linalg.solve(L.T, tmp)  # Sigma_xx^{-1} W
 
-    A = C @ B @ Sigma_t @ tmp.T                   # (q, p)
+    A = C @ B @ Sigma_t @ tmp.T  # (q, p)
 
     if x_new.ndim == 1:
         return A @ x_new
-    return x_new @ A.T                            # (N_test, q)
+    return x_new @ A.T
 
 
 def predict_conditional_covariance(params: Dict) -> np.ndarray:
-    """
-    Compute Cov[y_new | x_new, params].
-
-    Cov[y|x] = C(B² Σ_t + σ_h² I)C' + σ_f² I
-               - C B Σ_t W' Σ_xx^{-1} W Σ_t B C'
-
-    The conditional covariance is the same for every x_new.
-
-    Returns
-    -------
-    Cov_yx : (q, q) ndarray
-    """
-    W, C, B    = params["W"], params["C"], params["B"]
-    Sigma_t    = params["Sigma_t"]
-    sigma_e2   = params["sigma_e2"]
-    sigma_f2   = params["sigma_f2"]
-    sigma_h2   = params["sigma_h2"]
+    """Compute Cov[y_new | x_new, params]. The covariance is x-independent."""
+    W, C, B = params["W"], params["C"], params["B"]
+    Sigma_t = params["Sigma_t"]
+    sigma_e2 = float(params["sigma_e2"])
+    sigma_f2 = float(params["sigma_f2"])
+    sigma_h2 = float(params["sigma_h2"])
 
     r = W.shape[1]
     q = C.shape[0]
 
-    b        = np.diag(B)
+    b = np.diag(B)
     theta_t2 = np.diag(Sigma_t)
 
     Sigma_xx = W @ Sigma_t @ W.T + sigma_e2 * np.eye(W.shape[0])
     L = np.linalg.cholesky(Sigma_xx + 1e-9 * np.eye(Sigma_xx.shape[0]))
-    WtSig_inv = np.linalg.solve(L.T, np.linalg.solve(L, W))  # Σ_xx^{-1} W (p,r)
+    WtSig_inv = np.linalg.solve(L.T, np.linalg.solve(L, W))  # Sigma_xx^{-1} W (p,r)
 
-    # C(B² Σ_t + σ_h² I)C'
-    B2Sigma_t = np.diag(b ** 2 * theta_t2)
+    B2Sigma_t = np.diag(b**2 * theta_t2)
     term1 = C @ (B2Sigma_t + sigma_h2 * np.eye(r)) @ C.T + sigma_f2 * np.eye(q)
 
-    # C B Σ_t W' Σ_xx^{-1} W Σ_t B C'
-    # Note: WtSig_inv = Σ_xx^{-1} W  (p, r), so W' Σ_xx^{-1} W = W.T @ WtSig_inv (r, r).
     K = W.T @ WtSig_inv
-    K = (K + K.T) / 2  # numerical symmetry
-    M = C @ B @ Sigma_t @ K @ Sigma_t @ B @ C.T   # (q,q)
+    K = (K + K.T) / 2
+    M = C @ B @ Sigma_t @ K @ Sigma_t @ B @ C.T
 
     Cov = term1 - M
-    # Symmetrise and regularise
     Cov = (Cov + Cov.T) / 2 + 1e-9 * np.eye(q)
     return Cov
 
 
-def compute_credible_intervals(y_pred: np.ndarray,
-                                Cov_yx: np.ndarray,
-                                alpha: float = 0.05
-                                ) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Compute element-wise symmetric credible intervals.
-
-    CI_j = mean_j ± z_{α/2} * sqrt(Cov[j,j])
-
-    Parameters
-    ----------
-    y_pred : (N_test, q)  predicted means
-    Cov_yx : (q, q)       conditional covariance (same for all x_new)
-    alpha  : significance level (e.g. 0.05 for 95% CI)
-
-    Returns
-    -------
-    lower : (N_test, q)
-    upper : (N_test, q)
-    """
+def compute_credible_intervals(
+    y_pred: np.ndarray,
+    Cov_yx: np.ndarray,
+    alpha: float = 0.05,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Element-wise symmetric credible intervals: mean ± z * sqrt(diag(Cov))."""
     z = stats.norm.ppf(1 - alpha / 2)
-    std = np.sqrt(np.diag(Cov_yx))       # (q,)
-
+    std = np.sqrt(np.diag(Cov_yx))
     lower = y_pred - z * std[np.newaxis, :]
     upper = y_pred + z * std[np.newaxis, :]
     return lower, upper
 
 
-def empirical_coverage(y_true: np.ndarray,
-                        lower: np.ndarray,
-                        upper: np.ndarray) -> float:
-    """
-    Fraction of (test-sample, feature) entries whose true value falls
-    within [lower, upper].
-    """
+def empirical_coverage(y_true: np.ndarray, lower: np.ndarray, upper: np.ndarray) -> float:
+    """Fraction of (test-sample, feature) entries within [lower, upper]."""
     within = (y_true >= lower) & (y_true <= upper)
-    return within.mean()
+    return float(within.mean())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Single-fold prediction
+#  Fold-level helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def fit_and_predict_fold(X_train: np.ndarray,
-                          Y_train: np.ndarray,
-                          X_test:  np.ndarray,
-                          Y_test:  np.ndarray,
-                          r: int,
-                          n_starts: int = 16,
-                          algorithm_seed: int = 0,
-                          use_true_params: bool = False,
-                          true_params: Optional[Dict] = None,
-                          alphas: Optional[List[float]] = None,
-                          ) -> Dict:
-    """
-    Fit PPLS on training data and evaluate prediction coverage on test data.
+def _standardize_train_test(
+    X_train: np.ndarray,
+    Y_train: np.ndarray,
+    X_test: np.ndarray,
+    Y_test: np.ndarray,
+):
+    from sklearn.preprocessing import StandardScaler
 
-    Parameters
-    ----------
-    use_true_params : bool
-        If True, skip model fitting and use true_params directly
-        (simulates perfectly calibrated model as in the paper).
-    alphas : list of alpha values for credible intervals.
+    sx = StandardScaler()
+    sy = StandardScaler()
 
-    Returns
-    -------
-    dict with keys 'coverage_{alpha}' for each alpha.
-    """
-    if alphas is None:
-        alphas = [0.05, 0.10, 0.15, 0.20, 0.25]
+    X_train_s = sx.fit_transform(X_train)
+    Y_train_s = sy.fit_transform(Y_train)
+    X_test_s = sx.transform(X_test)
+    Y_test_s = sy.transform(Y_test)
 
-    p, q = X_train.shape[1], Y_train.shape[1]
+    return X_train_s, Y_train_s, X_test_s, Y_test_s, sx, sy
 
-    # ── Fit model ─────────────────────────────────────────────────────────────
-    if use_true_params:
-        params = true_params
-    else:
-        init_gen = InitialPointGenerator(p=p, q=q, r=r,
-                                         n_starts=n_starts,
-                                         random_seed=algorithm_seed)
-        starting_points = init_gen.generate_starting_points()
 
-        slm = ScalarLikelihoodMethod(p=p, q=q, r=r, max_iter=100,
-                                     use_noise_preestimation=True)
-        res = slm.fit(X_train, Y_train, starting_points)
+def _unstandardize_y_pred(y_pred_s: np.ndarray, sy) -> np.ndarray:
+    return sy.inverse_transform(y_pred_s)
 
-        params = {
-            "W":        res["W"],
-            "C":        res["C"],
-            "B":        res["B"],
-            "Sigma_t":  res["Sigma_t"],
-            "sigma_e2": res["sigma_e2"],
-            "sigma_f2": res["sigma_f2"],
-            "sigma_h2": res["sigma_h2"],
-        }
 
-    # ── Predict on test set ───────────────────────────────────────────────────
-    y_pred   = predict_conditional_mean(X_test, params)       # (N_test, q)
-    Cov_yx   = predict_conditional_covariance(params)         # (q, q)
+def _unstandardize_cov_y(Cov_s: np.ndarray, sy) -> np.ndarray:
+    # If y_s = (y - mean)/scale, then Cov(y) = D * Cov(y_s) * D, D = diag(scale)
+    scale = getattr(sy, "scale_", None)
+    if scale is None:
+        return Cov_s
+    D = np.diag(np.asarray(scale, dtype=float))
+    return D @ Cov_s @ D
 
-    # ── Compute coverage for each alpha ───────────────────────────────────────
-    fold_results = {}
-    for alpha in alphas:
-        lower, upper = compute_credible_intervals(y_pred, Cov_yx, alpha=alpha)
-        cov = empirical_coverage(Y_test, lower, upper) * 100  # percent
-        fold_results[f"alpha_{alpha}"] = cov
 
-    fold_results["y_pred"]  = y_pred
-    fold_results["Cov_yx"]  = Cov_yx
-    fold_results["params"]  = params
-    return fold_results
+def _fit_ppls_params_slm(
+    X_train_s: np.ndarray,
+    Y_train_s: np.ndarray,
+    *,
+    r: int,
+    n_starts: int,
+    seed: int,
+    slm_max_iter: int,
+) -> Dict:
+    p, q = X_train_s.shape[1], Y_train_s.shape[1]
+
+    init_gen = InitialPointGenerator(p=p, q=q, r=r, n_starts=n_starts, random_seed=seed)
+    starting_points = init_gen.generate_starting_points()
+
+    slm = ScalarLikelihoodMethod(
+        p=p,
+        q=q,
+        r=r,
+        max_iter=int(slm_max_iter),
+        use_noise_preestimation=True,
+    )
+    res = slm.fit(X_train_s, Y_train_s, starting_points)
+
+    return {
+        "W": res["W"],
+        "C": res["C"],
+        "B": res["B"],
+        "Sigma_t": res["Sigma_t"],
+        "sigma_e2": res["sigma_e2"],
+        "sigma_f2": res["sigma_f2"],
+        "sigma_h2": res["sigma_h2"],
+        "_meta": {"n_iterations": res.get("n_iterations"), "success": res.get("success")},
+    }
+
+
+def _fit_ppls_params_em(
+    X_train_s: np.ndarray,
+    Y_train_s: np.ndarray,
+    *,
+    r: int,
+    n_starts: int,
+    seed: int,
+    em_max_iter: int,
+    em_tol: float,
+) -> Dict:
+    p, q = X_train_s.shape[1], Y_train_s.shape[1]
+
+    init_gen = InitialPointGenerator(p=p, q=q, r=r, n_starts=n_starts, random_seed=seed)
+    starting_points = init_gen.generate_starting_points()
+
+    em = EMAlgorithm(p=p, q=q, r=r, max_iter=int(em_max_iter), tolerance=float(em_tol))
+    res = em.fit(X_train_s, Y_train_s, starting_points)
+
+    return {
+        "W": res["W"],
+        "C": res["C"],
+        "B": res["B"],
+        "Sigma_t": res["Sigma_t"],
+        "sigma_e2": res["sigma_e2"],
+        "sigma_f2": res["sigma_f2"],
+        "sigma_h2": res["sigma_h2"],
+        "_meta": {"n_iterations": res.get("n_iterations"), "log_likelihood": res.get("log_likelihood")},
+    }
+
+
+def _predict_ppls(
+    X_test_s: np.ndarray,
+    *,
+    params: Dict,
+):
+    y_pred_s = predict_conditional_mean(X_test_s, params)
+    Cov_s = predict_conditional_covariance(params)
+    return y_pred_s, Cov_s
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  k-fold cross-validation
+#  k-fold benchmark (Synthetic)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def kfold_prediction_experiment(
+def kfold_prediction_benchmark(
     X: np.ndarray,
     Y: np.ndarray,
-    r: int = 50,
-    n_folds: int = 5,
-    n_starts: int = 16,
+    *,
+    r: int,
+    n_folds: int,
+    n_starts: int,
+    seed: int,
+    slm_max_iter: int,
+    em_max_iter: int,
+    em_tol: float,
+    include_baselines: bool,
     alphas: Optional[List[float]] = None,
-    use_true_params: bool = True,
-    true_params: Optional[Dict] = None,
-    seed: int = 42,
     verbose: bool = True,
-) -> pd.DataFrame:
-    """
-    Run k-fold CV and collect empirical coverage at each alpha.
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Run 5-fold CV and return:
 
-    Parameters
-    ----------
-    use_true_params : bool
-        Paper's primary experiment: use the true parameters on the test set
-        (simulates perfectly calibrated model).  Set to False to use SLM
-        estimates from the training fold.
-
-    Returns
-    -------
-    coverage_df : DataFrame  (rows = folds, columns = alpha levels)
+    - metrics_per_fold: long table (fold, method, MSE/MAE/R2)
+    - metrics_summary : per method mean±std
+    - calib_summary   : per alpha expected + (SLM/EM) mean±std (percent)
     """
     if alphas is None:
         alphas = [0.05, 0.10, 0.15, 0.20, 0.25]
@@ -336,189 +327,184 @@ def kfold_prediction_experiment(
     N = X.shape[0]
     rng = np.random.RandomState(seed)
     indices = rng.permutation(N)
-    folds = np.array_split(indices, n_folds)
+    folds = np.array_split(indices, int(n_folds))
 
-    rows = []
+    metrics_rows: List[Dict] = []
+    calib_rows: List[Dict] = []
+
     for fold_idx, test_idx in enumerate(folds):
-        # Special-case n_folds=1 for quick debugging: use all samples for both train and test.
         if n_folds <= 1:
             train_idx = indices
         else:
             train_idx = np.concatenate([folds[j] for j in range(n_folds) if j != fold_idx])
 
         X_train, Y_train = X[train_idx], Y[train_idx]
-        X_test,  Y_test  = X[test_idx],  Y[test_idx]
+        X_test, Y_test = X[test_idx], Y[test_idx]
 
         if verbose:
-            # Print a full line so the one-click runner (which reads stdout line-by-line)
-            # can stream progress immediately even if the fold fit takes a long time.
             print(
-                f"  Fold {fold_idx+1}/{n_folds}  "
-                f"(train={len(train_idx)}, test={len(test_idx)})",
+                f"  Fold {fold_idx+1}/{n_folds}  (train={len(train_idx)}, test={len(test_idx)})",
                 flush=True,
             )
 
-
-
-        fold_res = fit_and_predict_fold(
-            X_train, Y_train, X_test, Y_test,
-            r=r,
-            n_starts=n_starts,
-            algorithm_seed=seed + fold_idx,
-            use_true_params=use_true_params,
-            true_params=true_params,
-            alphas=alphas,
+        # Shared fold standardisation for PPLS models
+        X_train_s, Y_train_s, X_test_s, _Y_test_s, _sx, sy = _standardize_train_test(
+            X_train, Y_train, X_test, Y_test
         )
 
-        row = {f"Alpha={a}": fold_res[f"alpha_{a}"] for a in alphas}
-        rows.append(row)
+        # --- PPLS-SLM ---
+        slm_params = _fit_ppls_params_slm(
+            X_train_s,
+            Y_train_s,
+            r=r,
+            n_starts=n_starts,
+            seed=seed + fold_idx,
+            slm_max_iter=slm_max_iter,
+        )
+        y_pred_slm_s, Cov_slm_s = _predict_ppls(X_test_s, params=slm_params)
+        y_pred_slm = _unstandardize_y_pred(y_pred_slm_s, sy)
 
-        if verbose:
-            # Print coverage at alpha=0.05 as a quick check
-            cov_05 = fold_res["alpha_0.05"]
-            print(f"Coverage@α=0.05: {cov_05:.2f}%")
+        m_slm = compute_regression_metrics(Y_test, y_pred_slm)
+        metrics_rows.append(
+            {
+                "fold": fold_idx + 1,
+                "method": "PPLS-SLM",
+                "mse": m_slm.mse,
+                "mae": m_slm.mae,
+                "r2": m_slm.r2_mean,
+            }
+        )
 
-    coverage_df = pd.DataFrame(rows)
-    coverage_df.index = [f"Fold {i+1}" for i in range(n_folds)]
-    return coverage_df
+        # Calibration (percent)
+        Cov_slm = _unstandardize_cov_y(Cov_slm_s, sy)
+        for a in alphas:
+            lower, upper = compute_credible_intervals(y_pred_slm, Cov_slm, alpha=float(a))
+            cov = 100.0 * empirical_coverage(Y_test, lower, upper)
+            calib_rows.append({"fold": fold_idx + 1, "method": "PPLS-SLM", "alpha": float(a), "coverage": cov})
 
+        # --- PPLS-EM ---
+        em_params = _fit_ppls_params_em(
+            X_train_s,
+            Y_train_s,
+            r=r,
+            n_starts=n_starts,
+            seed=seed + fold_idx,
+            em_max_iter=em_max_iter,
+            em_tol=em_tol,
+        )
+        y_pred_em_s, Cov_em_s = _predict_ppls(X_test_s, params=em_params)
+        y_pred_em = _unstandardize_y_pred(y_pred_em_s, sy)
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Summary statistics
-# ─────────────────────────────────────────────────────────────────────────────
+        m_em = compute_regression_metrics(Y_test, y_pred_em)
+        metrics_rows.append(
+            {
+                "fold": fold_idx + 1,
+                "method": "PPLS-EM",
+                "mse": m_em.mse,
+                "mae": m_em.mae,
+                "r2": m_em.r2_mean,
+            }
+        )
 
-def build_coverage_table(coverage_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Append a summary row (mean ± std across folds) and a 'Nominal' column.
+        Cov_em = _unstandardize_cov_y(Cov_em_s, sy)
+        for a in alphas:
+            lower, upper = compute_credible_intervals(y_pred_em, Cov_em, alpha=float(a))
+            cov = 100.0 * empirical_coverage(Y_test, lower, upper)
+            calib_rows.append({"fold": fold_idx + 1, "method": "PPLS-EM", "alpha": float(a), "coverage": cov})
 
-    Returns a formatted DataFrame matching Table 4 of the paper.
-    """
-    alphas = [float(c.split("=")[1]) for c in coverage_df.columns]
-    nominals = [(1 - a) * 100 for a in alphas]
+        # --- Baselines ---
+        if include_baselines:
+            plsr = run_plsr_prediction(X_train, Y_train, X_test, Y_test, n_components=r)
+            m_plsr = plsr["metrics"]
+            metrics_rows.append(
+                {
+                    "fold": fold_idx + 1,
+                    "method": "PLSR",
+                    "mse": m_plsr.mse,
+                    "mae": m_plsr.mae,
+                    "r2": m_plsr.r2_mean,
+                }
+            )
 
-    mean_row = coverage_df.mean()
-    std_row  = coverage_df.std()
+            ridge = run_ridge_prediction(X_train, Y_train, X_test, Y_test)
+            m_ridge = ridge["metrics"]
+            metrics_rows.append(
+                {
+                    "fold": fold_idx + 1,
+                    "method": "Ridge",
+                    "mse": m_ridge.mse,
+                    "mae": m_ridge.mae,
+                    "r2": m_ridge.r2_mean,
+                }
+            )
 
-    display = coverage_df.copy()
-    display.loc["Mean ± Std"] = [
-        f"{mean_row[c]:.2f} ± {std_row[c]:.2f}" for c in coverage_df.columns
-    ]
-    display.loc["Nominal (%)"] = [f"{nom:.0f}" for nom in nominals]
-    return display
+    metrics_per_fold = pd.DataFrame(metrics_rows)
 
+    def _summarise(df: pd.DataFrame) -> pd.DataFrame:
+        out = []
+        for method, sub in df.groupby("method", sort=False):
+            out.append(
+                {
+                    "method": method,
+                    "mse_mean": float(sub["mse"].mean()),
+                    "mse_std": float(sub["mse"].std(ddof=1)),
+                    "mae_mean": float(sub["mae"].mean()),
+                    "mae_std": float(sub["mae"].std(ddof=1)),
+                    "r2_mean": float(sub["r2"].mean()),
+                    "r2_std": float(sub["r2"].std(ddof=1)),
+                }
+            )
+        return pd.DataFrame(out)
 
-def check_calibration(coverage_df: pd.DataFrame,
-                       tol: float = 3.0) -> bool:
-    """
-    Verify that the empirical coverage at each alpha is within `tol` percentage
-    points of the nominal (1-alpha)*100 level on average across folds.
-    """
-    all_ok = True
-    print("\nCalibration check (mean coverage vs nominal):")
-    for col in coverage_df.columns:
-        alpha = float(col.split("=")[1])
-        nominal = (1 - alpha) * 100
-        empirical = coverage_df[col].mean()
-        diff = abs(empirical - nominal)
-        status = "OK" if diff <= tol else "FAIL"
-        print(f"  {col:14s}  nominal={nominal:.0f}%  empirical={empirical:.2f}%  "
-              f"diff={diff:.2f}%  {status}")
-        if diff > tol:
-            all_ok = False
-    return all_ok
+    metrics_summary = _summarise(metrics_per_fold)
+
+    calib_long = pd.DataFrame(calib_rows)
+
+    # Summary by alpha for SLM/EM
+    calib_summary_rows = []
+    for a, suba in calib_long.groupby("alpha", sort=True):
+        row = {"alpha": float(a), "expected_coverage": 100.0 * (1.0 - float(a))}
+        for method in ("PPLS-SLM", "PPLS-EM"):
+            subm = suba[suba["method"] == method]
+            row[f"{method}_mean"] = float(subm["coverage"].mean())
+            row[f"{method}_std"] = float(subm["coverage"].std(ddof=1))
+        calib_summary_rows.append(row)
+
+    calib_summary = pd.DataFrame(calib_summary_rows)
+
+    return metrics_per_fold, metrics_summary, calib_summary
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Visualisation (optional)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def plot_calibration(coverage_df: pd.DataFrame,
-                     output_dir: str = "results_prediction"):
-    """
-    Line plot: empirical coverage vs nominal level for each fold.
-    """
+def plot_calibration(calib_summary: pd.DataFrame, output_dir: str):
     try:
         import matplotlib.pyplot as plt
-        import matplotlib.ticker as mticker
     except ImportError:
         warnings.warn("matplotlib not found – skipping calibration plot.")
         return
 
-    alphas = [float(c.split("=")[1]) for c in coverage_df.columns]
-    nominals = [(1 - a) * 100 for a in alphas]
+    x = calib_summary["expected_coverage"].to_numpy()
+    y_slm = calib_summary["PPLS-SLM_mean"].to_numpy()
+    y_em = calib_summary["PPLS-EM_mean"].to_numpy()
 
-    fig, ax = plt.subplots(figsize=(7, 5))
+    fig, ax = plt.subplots(figsize=(6.5, 5))
+    ax.plot(x, y_slm, "o-", label="PPLS-SLM")
+    ax.plot(x, y_em, "s-", label="PPLS-EM")
+    ax.plot([x.min(), x.max()], [x.min(), x.max()], "k--", linewidth=1.2, label="Perfect")
 
-    # Individual folds
-    fold_rows = coverage_df.values  # (n_folds, n_alphas)
-    colors = plt.cm.Blues(np.linspace(0.3, 0.9, len(fold_rows)))
-    for i, (row, color) in enumerate(zip(fold_rows, colors)):
-        ax.plot(nominals, row, "o--", color=color, alpha=0.7,
-                linewidth=1.2, markersize=5, label=f"Fold {i+1}")
-
-    # Mean across folds
-    means = coverage_df.mean().values
-    ax.plot(nominals, means, "k-o", linewidth=2.0, markersize=7, label="Mean", zorder=5)
-
-    # Perfect calibration diagonal
-    ax.plot([min(nominals), max(nominals)], [min(nominals), max(nominals)],
-            "r--", linewidth=1.5, label="Perfect calibration")
-
-    ax.set_xlabel("Nominal coverage (%)", fontsize=11)
-    ax.set_ylabel("Empirical coverage (%)", fontsize=11)
-    ax.set_title("Prediction interval calibration (5-fold CV)", fontsize=12)
-    ax.legend(loc="upper left", fontsize=9)
+    ax.set_xlabel("Nominal coverage (%)")
+    ax.set_ylabel("Empirical coverage (%)")
+    ax.set_title("Calibration of predictive credible intervals")
     ax.grid(alpha=0.3)
-    ax.set_xlim(min(nominals) - 2, max(nominals) + 2)
-    ax.set_ylim(min(nominals) - 5, max(nominals) + 5)
-    plt.tight_layout()
+    ax.legend()
+    fig.tight_layout()
 
-    fig.savefig(os.path.join(output_dir, "calibration_plot.png"), dpi=150)
+    path = os.path.join(output_dir, "calibration_plot.png")
+    fig.savefig(path, dpi=150)
     plt.close(fig)
-    print(f"Calibration plot saved to {output_dir}/calibration_plot.png")
-
-
-def plot_prediction_example(X_test: np.ndarray,
-                             Y_test: np.ndarray,
-                             y_pred: np.ndarray,
-                             Cov_yx: np.ndarray,
-                             feature_idx: int = 0,
-                             alpha: float = 0.05,
-                             output_dir: str = "results_prediction"):
-    """
-    Scatter plot: true vs predicted for a single output feature,
-    with 95% credible intervals shown as error bars.
-    """
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError:
-        warnings.warn("matplotlib not found – skipping example prediction plot.")
-        return
-
-    z = stats.norm.ppf(1 - alpha / 2)
-    std_j = np.sqrt(Cov_yx[feature_idx, feature_idx])
-    err = z * std_j  # scalar (same for all test points)
-
-    true_j = Y_test[:, feature_idx]
-    pred_j = y_pred[:, feature_idx]
-
-    fig, ax = plt.subplots(figsize=(6, 5))
-    ax.errorbar(true_j, pred_j, yerr=err, fmt="o", color="steelblue",
-                ecolor="lightblue", elinewidth=1.5, capsize=3,
-                alpha=0.7, markersize=5, label=f"95% CI (α={alpha})")
-    lims = [min(true_j.min(), pred_j.min()) - 0.2,
-            max(true_j.max(), pred_j.max()) + 0.2]
-    ax.plot(lims, lims, "r--", linewidth=1.5, label="y = x")
-    ax.set_xlabel(f"True Y (feature {feature_idx})", fontsize=11)
-    ax.set_ylabel(f"Predicted Y (feature {feature_idx})", fontsize=11)
-    ax.set_title("True vs Predicted with Credible Intervals", fontsize=12)
-    ax.legend(fontsize=9)
-    ax.grid(alpha=0.3)
-    plt.tight_layout()
-
-    fig.savefig(os.path.join(output_dir, "prediction_example.png"), dpi=150)
-    plt.close(fig)
-    print(f"Prediction example plot saved to {output_dir}/prediction_example.png")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -526,111 +512,101 @@ def plot_prediction_example(X_test: np.ndarray,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="PPLS Prediction with Uncertainty Quantification"
-    )
-    parser.add_argument("--p",          type=int, default=200,
-                        help="Dimension of x (default: 200).")
-    parser.add_argument("--q",          type=int, default=200,
-                        help="Dimension of y (default: 200).")
-    parser.add_argument("--r",          type=int, default=50,
-                        help="Latent dimension (default: 50).")
-    parser.add_argument("--n_samples",  type=int, default=100,
-                        help="Total sample size N (default: 100).")
-    parser.add_argument("--n_folds",    type=int, default=5,
-                        help="Number of CV folds (default: 5).")
-    parser.add_argument("--n_starts",   type=int, default=16,
-                        help="Multi-start initializations per fold (default: 16).")
-    parser.add_argument("--sigma_e2",   type=float, default=0.1)
-    parser.add_argument("--sigma_f2",   type=float, default=0.1)
-    parser.add_argument("--sigma_h2",   type=float, default=0.05)
-    parser.add_argument("--use_true",   action="store_true",
-                        help="Use true params for prediction (paper's setup).")
-    parser.add_argument("--use_slm",    action="store_true",
-                        help="Fit SLM on each training fold (slower).")
-    parser.add_argument("--seed",       type=int, default=42,
-                        help="Random seed (default: 42).")
-    parser.add_argument("--output_dir", type=str, default="results_prediction",
-                        help="Directory to save results.")
-    parser.add_argument("--plot",       action="store_true",
-                        help="Generate calibration and example plots.")
-    return parser.parse_args()
+    p = argparse.ArgumentParser(description="PPLS prediction experiment (synthetic)")
+
+    p.add_argument("--p", type=int, default=200)
+    p.add_argument("--q", type=int, default=200)
+    p.add_argument("--r", type=int, default=50)
+    p.add_argument("--n_samples", type=int, default=100)
+    p.add_argument("--n_folds", type=int, default=5)
+    p.add_argument("--n_starts", type=int, default=16)
+
+    p.add_argument("--sigma_e2", type=float, default=0.1)
+    p.add_argument("--sigma_f2", type=float, default=0.1)
+    p.add_argument("--sigma_h2", type=float, default=0.05)
+
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--output_dir", type=str, default="results_prediction")
+
+    p.add_argument("--slm_max_iter", type=int, default=100)
+    p.add_argument("--em_max_iter", type=int, default=200)
+    p.add_argument("--em_tol", type=float, default=1e-4)
+
+    p.add_argument("--no_baselines", action="store_true", help="Skip PLSR and Ridge baselines")
+    p.add_argument("--plot", action="store_true")
+
+    return p.parse_args()
 
 
 def main():
     args = parse_args()
-
-    # Determine prediction mode
-    # Default (neither flag): paper's setup = use true parameters
-    use_true_params = not args.use_slm  # True unless --use_slm is set
-
     os.makedirs(args.output_dir, exist_ok=True)
-    alphas = [0.05, 0.10, 0.15, 0.20, 0.25]
 
-    print("="*60)
-    print("PPLS Prediction with Uncertainty Quantification")
-    print("="*60)
-    print(f"  Model:      p={args.p}, q={args.q}, r={args.r}")
-    print(f"  Samples:    N={args.n_samples}")
-    print(f"  CV folds:   {args.n_folds}")
-    print(f"  Mode:       {'true parameters (paper setup)' if use_true_params else 'SLM-fitted parameters'}")
-    print("="*60)
+    print("=" * 60)
+    print("Prediction experiment (synthetic)")
+    print("=" * 60)
+    print(f"  p={args.p}, q={args.q}, r={args.r}, N={args.n_samples}")
+    print(f"  folds={args.n_folds}, starts={args.n_starts}")
+    print(f"  SLM: max_iter={args.slm_max_iter} (spectral noise pre-estimation)")
+    print(f"  EM : max_iter={args.em_max_iter}, tol={args.em_tol}")
+    print("=" * 60)
 
-    # ── 1. Generate data ──────────────────────────────────────────────────────
     print("\nGenerating synthetic PPLS data...")
-    X, Y, true_params = generate_ppls_data(
-        p=args.p, q=args.q, r=args.r, n_samples=args.n_samples,
-        sigma_e2=args.sigma_e2, sigma_f2=args.sigma_f2, sigma_h2=args.sigma_h2,
+    X, Y, _true_params = generate_ppls_data(
+        p=args.p,
+        q=args.q,
+        r=args.r,
+        n_samples=args.n_samples,
+        sigma_e2=args.sigma_e2,
+        sigma_f2=args.sigma_f2,
+        sigma_h2=args.sigma_h2,
         seed=args.seed,
     )
-    print(f"  X: {X.shape},  Y: {Y.shape}")
+    print(f"  X: {X.shape}, Y: {Y.shape}")
 
-    # ── 2. Run k-fold CV ──────────────────────────────────────────────────────
-    print(f"\nRunning {args.n_folds}-fold cross-validation...")
-    coverage_df = kfold_prediction_experiment(
-        X, Y,
+    alphas = [0.05, 0.10, 0.15, 0.20, 0.25]
+
+    print(f"\nRunning {args.n_folds}-fold CV benchmark...")
+    metrics_per_fold, metrics_summary, calib_summary = kfold_prediction_benchmark(
+        X,
+        Y,
         r=args.r,
         n_folds=args.n_folds,
         n_starts=args.n_starts,
-        alphas=alphas,
-        use_true_params=use_true_params,
-        true_params=true_params if use_true_params else None,
         seed=args.seed,
+        slm_max_iter=args.slm_max_iter,
+        em_max_iter=args.em_max_iter,
+        em_tol=args.em_tol,
+        include_baselines=(not args.no_baselines),
+        alphas=alphas,
         verbose=True,
     )
 
-    # ── 3. Print summary table ────────────────────────────────────────────────
-    print("\n── Coverage table (%, across folds) ──")
-    display_df = build_coverage_table(coverage_df)
-    print(display_df.to_string())
+    # Save
+    metrics_per_fold.to_csv(os.path.join(args.output_dir, "prediction_metrics_per_fold.csv"), index=False)
+    metrics_summary.to_csv(os.path.join(args.output_dir, "prediction_metrics_summary.csv"), index=False)
+    calib_summary.to_csv(os.path.join(args.output_dir, "calibration_comparison.csv"), index=False)
 
-    # ── 4. Calibration check ──────────────────────────────────────────────────
-    check_calibration(coverage_df)
+    print("\n── Prediction metrics (mean ± std across folds) ──")
+    disp = metrics_summary.copy()
+    for k in ("mse", "mae", "r2"):
+        disp[f"{k}"] = disp[f"{k}_mean"].map(lambda x: f"{x:.4g}") + " ± " + disp[f"{k}_std"].map(lambda x: f"{x:.4g}")
+    print(disp[["method", "mse", "mae", "r2"]].to_string(index=False))
 
-    # ── 5. Save results ───────────────────────────────────────────────────────
-    coverage_df.to_csv(os.path.join(args.output_dir, "coverage_results.csv"))
-    display_df.to_csv(os.path.join(args.output_dir, "coverage_table.csv"))
-    print(f"\nResults saved to: {args.output_dir}/")
+    print("\n── Calibration summary (mean ± std, %) ──")
+    disp_c = calib_summary.copy()
+    disp_c["PPLS-SLM"] = disp_c["PPLS-SLM_mean"].map(lambda x: f"{x:.2f}") + " ± " + disp_c["PPLS-SLM_std"].map(lambda x: f"{x:.2f}")
+    disp_c["PPLS-EM"] = disp_c["PPLS-EM_mean"].map(lambda x: f"{x:.2f}") + " ± " + disp_c["PPLS-EM_std"].map(lambda x: f"{x:.2f}")
+    print(disp_c[["alpha", "expected_coverage", "PPLS-SLM", "PPLS-EM"]].to_string(index=False))
 
-    # ── 6. Plots ──────────────────────────────────────────────────────────────
     if args.plot:
-        plot_calibration(coverage_df, args.output_dir)
+        plot_calibration(calib_summary, args.output_dir)
+        print(f"\nSaved plot: {args.output_dir}/calibration_plot.png")
 
-        # Generate one example prediction (using true params for illustration)
-        rng = np.random.RandomState(args.seed)
-        test_idx = rng.choice(args.n_samples, max(10, args.n_samples // args.n_folds),
-                               replace=False)
-        X_test = X[test_idx]
-        Y_test = Y[test_idx]
+    print(f"\nResults saved to: {args.output_dir}/")
+    print("Prediction experiment complete.")
 
-        y_pred  = predict_conditional_mean(X_test, true_params)
-        Cov_yx  = predict_conditional_covariance(true_params)
-        plot_prediction_example(X_test, Y_test, y_pred, Cov_yx,
-                                 feature_idx=0, alpha=0.05,
-                                 output_dir=args.output_dir)
-
-    print("\nPrediction experiment complete.")
-    return coverage_df
+    return metrics_summary
 
 
 if __name__ == "__main__":

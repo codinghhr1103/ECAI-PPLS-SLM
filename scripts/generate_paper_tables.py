@@ -314,8 +314,13 @@ def generate_detection_table(*, artifacts_dir: Path, out_path: Path) -> None:
 
 
 def generate_prediction_coverage_table(*, artifacts_dir: Path, out_path: Path) -> None:
-    path = artifacts_dir / "prediction" / "coverage_table.csv"
+    # Backward-compatible: old location was `prediction/coverage_table.csv`.
+    # New prediction pipeline stores artifacts under `prediction/synthetic/`.
+    path_new = artifacts_dir / "prediction" / "synthetic" / "coverage_table.csv"
+    path_old = artifacts_dir / "prediction" / "coverage_table.csv"
+    path = path_new if path_new.exists() else path_old
     df = pd.read_csv(path, index_col=0)
+
 
     # Columns like 'Alpha=0.05'
     def parse_alpha(col: str) -> float:
@@ -358,8 +363,176 @@ def generate_prediction_coverage_table(*, artifacts_dir: Path, out_path: Path) -
     out_path.write_text("\n".join(tex), encoding="utf-8")
 
 
+def _pm_makecell_float(mean: float, std: float, *, fmt: str = ".3f") -> str:
+    m = format(float(mean), fmt)
+    s = format(float(std), fmt)
+    return f"\\makecell{{{m}\\\\$\\pm${s}}}"
+
+
+def generate_prediction_synthetic_metrics_table(*, artifacts_dir: Path, out_path: Path) -> None:
+    """Synthetic prediction accuracy table (MSE/MAE/R2) across 5 folds."""
+    path = artifacts_dir / "prediction" / "synthetic" / "prediction_metrics_summary.csv"
+    if not path.exists():
+        raise FileNotFoundError(f"missing: {path}")
+
+    df = pd.read_csv(path)
+
+    order = ["PPLS-SLM", "PPLS-EM", "PLSR", "Ridge"]
+    df["method"] = df["method"].astype(str)
+
+    rows = []
+    for m in order:
+        sub = df[df["method"] == m]
+        if sub.empty:
+            continue
+        r = sub.iloc[0]
+        rows.append(
+            (
+                m,
+                _pm_makecell_float(r["mse_mean"], r["mse_std"], fmt=".4g"),
+                _pm_makecell_float(r["mae_mean"], r["mae_std"], fmt=".4g"),
+                _pm_makecell_float(r["r2_mean"], r["r2_std"], fmt=".4g"),
+            )
+        )
+
+    tex: list[str] = []
+    tex.append(r"\setlength{\tabcolsep}{4pt}")
+    tex.append(r"\begin{table}[t]\small")
+    tex.append(r"\centering")
+    tex.append(r"\caption{Synthetic prediction accuracy (5-fold CV): mean $\pm$ std.}")
+    tex.append(r"\label{tab:pred_synth_metrics}")
+    tex.append(r"\begin{tabular}{lccc}")
+    tex.append(r"\toprule")
+    tex.append(r"\textbf{Method} & \textbf{MSE} & \textbf{MAE} & \textbf{$R^2$} \\")
+    tex.append(r"\midrule")
+    for method, mse, mae, r2 in rows:
+        tex.append(f"{method} & {mse} & {mae} & {r2} \\")
+    tex.append(r"\bottomrule")
+    tex.append(r"\end{tabular}")
+    tex.append(r"\end{table}")
+    tex.append("")
+
+    out_path.write_text("\n".join(tex), encoding="utf-8")
+
+
+def generate_prediction_synthetic_calibration_table(*, artifacts_dir: Path, out_path: Path) -> None:
+    """Synthetic calibration comparison table (PPLS-SLM vs PPLS-EM)."""
+    path = artifacts_dir / "prediction" / "synthetic" / "calibration_comparison.csv"
+    if not path.exists():
+        raise FileNotFoundError(f"missing: {path}")
+
+    df = pd.read_csv(path)
+
+    def fmt_pct(x: float) -> str:
+        return f"{float(x):.2f}\\%"
+
+    tex: list[str] = []
+    tex.append(r"\setlength{\tabcolsep}{4pt}")
+    tex.append(r"\begin{table}[t]\small")
+    tex.append(r"\centering")
+    tex.append(r"\caption{Synthetic calibration of predictive credible intervals (5-fold CV).}")
+    tex.append(r"\label{tab:pred_synth_calib}")
+    tex.append(r"\begin{tabular}{c|c|cc}")
+    tex.append(r"\toprule")
+    tex.append(r"$\alpha$ & Expected & PPLS-SLM & PPLS-EM \\")
+    tex.append(r"\midrule")
+
+    for _, r in df.sort_values("alpha").iterrows():
+        a = float(r["alpha"])
+        expc = fmt_pct(r["expected_coverage"])
+        slm = f"{fmt_pct(r['PPLS-SLM_mean'])} $\\pm$ {fmt_pct(r['PPLS-SLM_std'])}"
+        em = f"{fmt_pct(r['PPLS-EM_mean'])} $\\pm$ {fmt_pct(r['PPLS-EM_std'])}"
+        tex.append(f"{a:.2f} & {expc} & {slm} & {em} \\")
+
+    tex.append(r"\bottomrule")
+    tex.append(r"\end{tabular}")
+    tex.append(r"\end{table}")
+    tex.append("")
+
+    out_path.write_text("\n".join(tex), encoding="utf-8")
+
+
+def generate_prediction_brca_metrics_table(*, artifacts_dir: Path, out_path: Path) -> None:
+    """BRCA prediction accuracy table at r* chosen by CV-MSE per method."""
+    path = artifacts_dir / "prediction" / "brca" / "brca_prediction_summary.csv"
+    if not path.exists():
+        raise FileNotFoundError(f"missing: {path}")
+
+    df = pd.read_csv(path)
+    df["method"] = df["method"].astype(str)
+    df["r"] = df["r"].astype(str)
+
+    order = ["PPLS-SLM", "PPLS-EM", "PLSR", "Ridge"]
+
+    tex: list[str] = []
+    tex.append(r"\setlength{\tabcolsep}{4pt}")
+    tex.append(r"\begin{table}[t]\small")
+    tex.append(r"\centering")
+    tex.append(r"\caption{BRCA prediction accuracy (5-fold CV). For PPLS/PLSR, $r^*$ minimises CV-MSE.}")
+    tex.append(r"\label{tab:pred_brca_metrics}")
+    tex.append(r"\begin{tabular}{lcccc}")
+    tex.append(r"\toprule")
+    tex.append(r"\textbf{Method} & $r$ & \textbf{MSE} & \textbf{MAE} & \textbf{$R^2$} \\")
+    tex.append(r"\midrule")
+
+    for m in order:
+        sub = df[df["method"] == m]
+        if sub.empty:
+            continue
+        r0 = sub.iloc[0]
+        mse = _pm_makecell_float(r0["mse_mean"], r0["mse_std"], fmt=".4g")
+        mae = _pm_makecell_float(r0["mae_mean"], r0["mae_std"], fmt=".4g")
+        r2 = _pm_makecell_float(r0["r2_mean"], r0["r2_std"], fmt=".4g")
+        tex.append(f"{m} & {str(r0['r'])} & {mse} & {mae} & {r2} \\")
+
+    tex.append(r"\bottomrule")
+    tex.append(r"\end{tabular}")
+    tex.append(r"\end{table}")
+    tex.append("")
+
+    out_path.write_text("\n".join(tex), encoding="utf-8")
+
+
+def generate_prediction_brca_calibration_table(*, artifacts_dir: Path, out_path: Path) -> None:
+    """BRCA calibration table for PPLS-SLM at the selected r*."""
+    path = artifacts_dir / "prediction" / "brca" / "brca_calibration_table.csv"
+    if not path.exists():
+        raise FileNotFoundError(f"missing: {path}")
+
+    df = pd.read_csv(path)
+
+    # Expect columns: Alpha, Expected Coverage, Fold 1..Fold 5, Mean
+    folds = [f"Fold {i}" for i in range(1, 6)]
+
+    tex: list[str] = []
+    tex.append(r"\setlength{\tabcolsep}{3pt}")
+    tex.append(r"\begin{table}[t]\small")
+    tex.append(r"\centering")
+    tex.append(r"\caption{BRCA calibration of PPLS-SLM predictive credible intervals (element-wise coverage, \%).}")
+    tex.append(r"\label{tab:pred_brca_calib}")
+    tex.append(r"\begin{tabular}{c|c|ccccc|c}")
+    tex.append(r"\toprule")
+    tex.append(r"$\alpha$ & Expected & Fold 1 & Fold 2 & Fold 3 & Fold 4 & Fold 5 & Mean \\")
+    tex.append(r"\midrule")
+
+    for _, r in df.iterrows():
+        a = float(r["Alpha"])
+        expc = _latex_escape(str(r["Expected Coverage"]))
+        vals = [_latex_escape(str(r[c])) for c in folds]
+        mean = _latex_escape(str(r["Mean"]))
+        tex.append(f"{a:.2f} & {expc} & " + " & ".join(vals) + f" & {mean} \\")
+
+    tex.append(r"\bottomrule")
+    tex.append(r"\end{tabular}")
+    tex.append(r"\end{table}")
+    tex.append("")
+
+    out_path.write_text("\n".join(tex), encoding="utf-8")
+
+
 def generate_noise_ablation_exp2_table(*, artifacts_dir: Path, out_path: Path) -> None:
     """Noise ablation Exp2 summary table.
+
 
     Source: `paper/artifacts/noise_ablation/exp2_joint_vs_fixed/exp2_summary_table.csv`
     """
@@ -683,12 +856,22 @@ def main() -> None:
     generate_parameter_mse_table(artifacts_dir=artifacts_dir, out_path=out_dir / "tab_parameter_mse.tex")
     generate_top10_pairs_table(artifacts_dir=artifacts_dir, out_path=out_dir / "tab_top10_pairs.tex")
     generate_detection_table(artifacts_dir=artifacts_dir, out_path=out_dir / "tab_detected_pairs.tex")
+
+    # Prediction tables (synthetic + BRCA). These depend on synced artifacts.
+    # Synthetic
+    generate_prediction_synthetic_metrics_table(artifacts_dir=artifacts_dir, out_path=out_dir / "tab_prediction_synth_metrics.tex")
+    generate_prediction_synthetic_calibration_table(artifacts_dir=artifacts_dir, out_path=out_dir / "tab_prediction_synth_calibration.tex")
+
+    # BRCA
+    generate_prediction_brca_metrics_table(artifacts_dir=artifacts_dir, out_path=out_dir / "tab_prediction_brca_metrics.tex")
+    generate_prediction_brca_calibration_table(artifacts_dir=artifacts_dir, out_path=out_dir / "tab_prediction_brca_calibration.tex")
+
+    # Legacy coverage table (kept for backward compatibility).
     generate_prediction_coverage_table(artifacts_dir=artifacts_dir, out_path=out_dir / "tab_prediction_coverage.tex")
 
 
-
-
     generate_paper_metrics(artifacts_dir=artifacts_dir, out_path=paper_dir / "generated" / "metrics.tex")
+
 
     print(f"[OK] Wrote tables into: {out_dir}")
 

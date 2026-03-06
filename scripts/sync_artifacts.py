@@ -91,13 +91,35 @@ def main() -> int:
     copied += int(copy_file(assoc_root / "top10_pairs_slm.csv", assoc_dir / "top10_pairs_slm.csv"))
     copied += int(copy_file(assoc_root / "detection_comparison.png", assoc_dir / "detection_comparison.png"))
 
-    # --- Prediction application ---
+    # --- Prediction application (synthetic) ---
     pred_root = repo_root / "results_prediction"
     pred_dir = artifacts / "prediction"
-    copied += int(copy_file(pred_root / "coverage_results.csv", pred_dir / "coverage_results.csv"))
-    copied += int(copy_file(pred_root / "coverage_table.csv", pred_dir / "coverage_table.csv"))
-    copied += int(copy_file(pred_root / "calibration_plot.png", pred_dir / "calibration_plot.png"))
-    copied += int(copy_file(pred_root / "prediction_example.png", pred_dir / "prediction_example.png"))
+    pred_syn = pred_dir / "synthetic"
+
+    # New outputs (predictive accuracy + calibration comparison)
+    copied += int(copy_file(pred_root / "prediction_metrics_per_fold.csv", pred_syn / "prediction_metrics_per_fold.csv"))
+    copied += int(copy_file(pred_root / "prediction_metrics_summary.csv", pred_syn / "prediction_metrics_summary.csv"))
+    copied += int(copy_file(pred_root / "calibration_comparison.csv", pred_syn / "calibration_comparison.csv"))
+
+    # Optional plots
+    copied += int(copy_file(pred_root / "calibration_plot.png", pred_syn / "calibration_plot.png"))
+
+    # Backward-compatible legacy outputs (may be absent after refactor)
+    copied += int(copy_file(pred_root / "coverage_results.csv", pred_syn / "coverage_results.csv"))
+    copied += int(copy_file(pred_root / "coverage_table.csv", pred_syn / "coverage_table.csv"))
+    copied += int(copy_file(pred_root / "prediction_example.png", pred_syn / "prediction_example.png"))
+
+    # --- Prediction application (BRCA) ---
+    brca_root = repo_root / "results_prediction_brca"
+    pred_brca = pred_dir / "brca"
+
+    copied += int(copy_file(brca_root / "brca_prediction_summary.csv", pred_brca / "brca_prediction_summary.csv"))
+    copied += int(copy_file(brca_root / "brca_prediction_by_r.csv", pred_brca / "brca_prediction_by_r.csv"))
+    copied += int(copy_file(brca_root / "brca_prediction_per_fold.csv", pred_brca / "brca_prediction_per_fold.csv"))
+    copied += int(copy_file(brca_root / "brca_calibration_table.csv", pred_brca / "brca_calibration_table.csv"))
+
+
+
 
 
 

@@ -4,9 +4,11 @@ Runs (in order):
   1) Monte Carlo simulation pipeline (ppls_slm.cli.montecarlo)
   2) Speed experiment (ppls_slm.benchmarks.speed_experiment)
   3) Association application (ppls_slm.apps.association_analysis)
-  4) Prediction application (ppls_slm.apps.prediction)
-  5) Noise pre-estimation ablation (ppls_slm.cli.noise_preestimation_ablation)
-  6) Sync small paper artifacts into paper/artifacts (scripts/sync_artifacts.py)
+  4) Prediction application (synthetic; ppls_slm.apps.prediction)
+  5) BRCA prediction benchmark (ppls_slm.apps.brca_prediction) [optional]
+  6) BRCA calibration benchmark (ppls_slm.apps.brca_calibration) [optional]
+  7) Sync small paper artifacts into paper/artifacts (scripts/sync_artifacts.py)
+
 
 Usage (from repo root):
   python scripts/run_all_experiments.py
@@ -217,6 +219,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     parser.add_argument("--skip-speed", action="store_true", help="Skip speed experiment")
     parser.add_argument("--skip-association", action="store_true", help="Skip association application")
     parser.add_argument("--skip-prediction", action="store_true", help="Skip prediction application")
+    parser.add_argument("--skip-brca", action="store_true", help="Skip BRCA prediction + calibration")
+
 
     parser.add_argument("--no-sync", action="store_true", help="Do not run scripts/sync_artifacts.py")
 
@@ -283,7 +287,10 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         run_speed = bool(run_cfg.get("speed", True)) and (not args.skip_speed)
         run_association = bool(run_cfg.get("association", True)) and (not args.skip_association)
         run_prediction = bool(run_cfg.get("prediction", True)) and (not args.skip_prediction)
+        run_brca_prediction = bool(run_cfg.get("brca_prediction", False)) and (not args.skip_brca)
+        run_brca_calibration = bool(run_cfg.get("brca_calibration", False)) and (not args.skip_brca)
         run_sync = bool(run_cfg.get("sync_artifacts", True)) and (not args.no_sync)
+
 
         # App-specific config
         assoc_cfg = exp_cfg.get("association", {})
@@ -316,6 +323,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
             _rm_tree((repo_root / str(assoc_out)).resolve())
             _rm_tree((repo_root / str(pred_out)).resolve())
+            _rm_tree((repo_root / "results_prediction_brca").resolve())
+
 
 
             if args.clean_artifacts:
@@ -372,12 +381,26 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             if bool(pred_cfg.get("plot", True)):
                 cmd += ["--plot"]
 
-            if bool(pred_cfg.get("use_slm", False)):
-                cmd += ["--use_slm"]
-            elif bool(pred_cfg.get("use_true", False)):
-                cmd += ["--use_true"]
+            if bool(pred_cfg.get("no_baselines", False)):
+                cmd += ["--no_baselines"]
 
-            for k in ("p", "q", "r", "n_samples", "n_folds", "n_starts", "seed", "sigma_e2", "sigma_f2", "sigma_h2"):
+
+            for k in (
+                "p",
+                "q",
+                "r",
+                "n_samples",
+                "n_folds",
+                "n_starts",
+                "seed",
+                "sigma_e2",
+                "sigma_f2",
+                "sigma_h2",
+                "slm_max_iter",
+                "em_max_iter",
+                "em_tol",
+            ):
+
                 if k in pred_cfg and pred_cfg.get(k) is not None:
                     cmd += [f"--{k}", str(pred_cfg.get(k))]
 
@@ -388,13 +411,66 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
 
 
-        # 6) Sync artifacts
-        if run_sync:
-            code = tee_run([sys.executable, "-u", "scripts/sync_artifacts.py"], cwd=repo_root, log_path=logs_dir / "06_sync_artifacts.log", env=run_env)
 
+
+        # 5) BRCA prediction benchmark (optional)
+        if run_brca_prediction:
+            brca_pred_cfg = exp_cfg.get("prediction_brca", {})
+            brca_out = brca_pred_cfg.get("output_dir", "results_prediction_brca")
+
+            cmd = [sys.executable, "-u", "-m", "ppls_slm.apps.brca_prediction", "--output_dir", str(brca_out)]
+
+            # Use the bundled BRCA dataset by default.
+            brca_data_path = brca_pred_cfg.get("brca_data") or brca_data
+            if brca_data_path:
+                cmd += ["--brca_data", str(brca_data_path)]
+
+            for k in (
+                "seed",
+                "n_folds",
+                "r_grid",
+                "slm_n_starts",
+                "slm_max_iter",
+                "em_n_starts",
+                "em_max_iter",
+                "em_tol",
+            ):
+                if k in brca_pred_cfg and brca_pred_cfg.get(k) is not None:
+                    cmd += [f"--{k}", str(brca_pred_cfg.get(k))]
+
+            code = tee_run(cmd, cwd=repo_root, log_path=logs_dir / "05_brca_prediction.log", env=run_env)
+            if code != 0:
+                return code
+
+        # 6) BRCA calibration benchmark (optional)
+        if run_brca_calibration:
+            brca_pred_cfg = exp_cfg.get("prediction_brca", {})
+            brca_out = brca_pred_cfg.get("output_dir", "results_prediction_brca")
+
+            cmd = [sys.executable, "-u", "-m", "ppls_slm.apps.brca_calibration", "--output_dir", str(brca_out)]
+
+            brca_data_path = brca_pred_cfg.get("brca_data") or brca_data
+            if brca_data_path:
+                cmd += ["--brca_data", str(brca_data_path)]
+
+            # Point to the summary written by the prediction benchmark.
+            cmd += ["--prediction_summary", str(Path(brca_out) / "brca_prediction_summary.csv")]
+
+            for k in ("seed", "n_folds", "slm_n_starts", "slm_max_iter"):
+                if k in brca_pred_cfg and brca_pred_cfg.get(k) is not None:
+                    cmd += [f"--{k}", str(brca_pred_cfg.get(k))]
+
+            code = tee_run(cmd, cwd=repo_root, log_path=logs_dir / "06_brca_calibration.log", env=run_env)
+            if code != 0:
+                return code
+
+        # 7) Sync artifacts
+        if run_sync:
+            code = tee_run([sys.executable, "-u", "scripts/sync_artifacts.py"], cwd=repo_root, log_path=logs_dir / "07_sync_artifacts.log", env=run_env)
 
             if code != 0:
                 return code
+
 
 
         elapsed = time.time() - start
