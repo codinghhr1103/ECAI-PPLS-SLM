@@ -152,6 +152,11 @@ class ScalarLikelihoodMethod(PPLSAlgorithm):
         barrier_tol: float = 1e-3,
         initial_constr_penalty: float = 1.0,
         constraint_slack: float = 1e-2,
+        # speed/observability helpers
+        verbose: bool = False,
+        progress_every: int = 1,
+        early_stop_patience: Optional[int] = None,
+        early_stop_rel_improvement: Optional[float] = None,
     ):
         super().__init__(p, q, r)
         self.optimizer = optimizer
@@ -166,6 +171,14 @@ class ScalarLikelihoodMethod(PPLSAlgorithm):
         self.barrier_tol = float(barrier_tol)
         self.initial_constr_penalty = float(initial_constr_penalty)
         self.constraint_slack = float(constraint_slack)
+
+        self.verbose = bool(verbose)
+        self.progress_every = max(1, int(progress_every))
+        self.early_stop_patience = None if early_stop_patience is None else max(1, int(early_stop_patience))
+        self.early_stop_rel_improvement = None if early_stop_rel_improvement is None else float(early_stop_rel_improvement)
+
+
+
 
 
 
@@ -222,12 +235,58 @@ class ScalarLikelihoodMethod(PPLSAlgorithm):
             starting_points_use = starting_points
 
         solutions = []
-        for theta0 in starting_points_use:
+        best_fun = np.inf
+        best_seen = None
+        no_improve = 0
+        n_total = len(starting_points_use)
+
+        for start_idx, theta0 in enumerate(starting_points_use, start=1):
+            if self.verbose and (start_idx == 1 or start_idx % self.progress_every == 0 or start_idx == n_total):
+                print(
+                    f"      [SLM] start {start_idx}/{n_total} (optimizer={self.optimizer}, max_iter={self.max_iter}, gtol={self.gtol}, xtol={self.xtol})...",
+                    flush=True,
+                )
+
             try:
                 res = self._optimize_single_start(theta0, objective, constraints, bounds)
                 solutions.append(res)
+
+                # Track best objective seen so far (lower is better).
+                try:
+                    fun_val = float(res.get('fun', np.inf))
+                except Exception:
+                    fun_val = np.inf
+
+                if np.isfinite(fun_val) and fun_val < best_fun:
+                    if best_fun < np.inf and self.early_stop_rel_improvement is not None:
+                        rel_improve = (best_fun - fun_val) / (abs(best_fun) + 1e-12)
+                    else:
+                        rel_improve = np.inf
+
+                    best_fun = fun_val
+                    best_seen = res
+
+                    # Reset patience counter if we improved enough.
+                    if self.early_stop_rel_improvement is None or rel_improve >= float(self.early_stop_rel_improvement):
+                        no_improve = 0
+                    else:
+                        no_improve += 1
+                else:
+                    no_improve += 1
+
+                # Optional early-stop across multi-starts (speed mode).
+                if self.early_stop_patience is not None and no_improve >= int(self.early_stop_patience):
+                    if self.verbose:
+                        print(
+                            f"      [SLM] early-stopping multi-start after {start_idx}/{n_total} starts (no_improve={no_improve}).",
+                            flush=True,
+                        )
+                    break
+
             except Exception as e:
                 warnings.warn(f"SLM optimisation failed for one start: {e}")
+                no_improve += 1
+
 
         best = self._select_best_solution(solutions)
 

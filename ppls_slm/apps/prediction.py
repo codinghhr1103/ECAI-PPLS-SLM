@@ -215,6 +215,30 @@ def _unstandardize_cov_y(Cov_s: np.ndarray, sy) -> np.ndarray:
     return D @ Cov_s @ D
 
 
+def _data_driven_theta0(X_train_s: np.ndarray, Y_train_s: np.ndarray, *, r: int) -> np.ndarray:
+    """Deterministic, data-driven starting point.
+
+    Uses the first r right-singular vectors of X and Y as orthonormal loadings.
+    This typically reduces the number of trust-constr iterations and makes the
+    multi-start strategy much cheaper.
+    """
+    # X_train_s: (N, p)  => Vt_x.T: (p, p)
+    _Ux, _sx, Vt_x = np.linalg.svd(X_train_s, full_matrices=False)
+    W0 = Vt_x.T[:, :r]
+
+    _Uy, _sy, Vt_y = np.linalg.svd(Y_train_s, full_matrices=False)
+    C0 = Vt_y.T[:, :r]
+
+    theta0 = np.linspace(1.0, 0.5, int(r))
+    b0 = np.linspace(1.0, 0.5, int(r))
+    sigma_h2_0 = 0.1
+
+    return np.concatenate([W0.flatten(), C0.flatten(), theta0, b0, [sigma_h2_0]])
+
+
+
+
+
 def _fit_ppls_params_slm(
     X_train_s: np.ndarray,
     Y_train_s: np.ndarray,
@@ -223,19 +247,42 @@ def _fit_ppls_params_slm(
     n_starts: int,
     seed: int,
     slm_max_iter: int,
+    slm_optimizer: str,
+    slm_gtol: float,
+    slm_xtol: float,
+    slm_barrier_tol: float,
+    slm_constraint_slack: float,
+    slm_progress_every: int,
+    slm_early_stop_patience: Optional[int],
+    slm_early_stop_rel_improvement: Optional[float],
+    slm_data_start: bool,
+    slm_verbose: bool,
 ) -> Dict:
     p, q = X_train_s.shape[1], Y_train_s.shape[1]
 
     init_gen = InitialPointGenerator(p=p, q=q, r=r, n_starts=n_starts, random_seed=seed)
     starting_points = init_gen.generate_starting_points()
 
+    if bool(slm_data_start) and starting_points:
+        starting_points[0] = _data_driven_theta0(X_train_s, Y_train_s, r=r)
+
     slm = ScalarLikelihoodMethod(
         p=p,
         q=q,
         r=r,
+        optimizer=str(slm_optimizer),
         max_iter=int(slm_max_iter),
         use_noise_preestimation=True,
+        gtol=float(slm_gtol),
+        xtol=float(slm_xtol),
+        barrier_tol=float(slm_barrier_tol),
+        constraint_slack=float(slm_constraint_slack),
+        verbose=bool(slm_verbose),
+        progress_every=int(slm_progress_every),
+        early_stop_patience=slm_early_stop_patience,
+        early_stop_rel_improvement=slm_early_stop_rel_improvement,
     )
+
     res = slm.fit(X_train_s, Y_train_s, starting_points)
 
     return {
@@ -250,6 +297,9 @@ def _fit_ppls_params_slm(
     }
 
 
+
+
+
 def _fit_ppls_params_em(
     X_train_s: np.ndarray,
     Y_train_s: np.ndarray,
@@ -259,14 +309,19 @@ def _fit_ppls_params_em(
     seed: int,
     em_max_iter: int,
     em_tol: float,
+    em_data_start: bool,
 ) -> Dict:
     p, q = X_train_s.shape[1], Y_train_s.shape[1]
 
     init_gen = InitialPointGenerator(p=p, q=q, r=r, n_starts=n_starts, random_seed=seed)
     starting_points = init_gen.generate_starting_points()
 
+    if bool(em_data_start) and starting_points:
+        starting_points[0] = _data_driven_theta0(X_train_s, Y_train_s, r=r)
+
     em = EMAlgorithm(p=p, q=q, r=r, max_iter=int(em_max_iter), tolerance=float(em_tol))
     res = em.fit(X_train_s, Y_train_s, starting_points)
+
 
     return {
         "W": res["W"],
@@ -291,8 +346,157 @@ def _predict_ppls(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Single-fold worker (for parallel CV)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _run_single_fold_prediction(
+    *,
+    fold_idx: int,
+    train_idx: np.ndarray,
+    test_idx: np.ndarray,
+    X: np.ndarray,
+    Y: np.ndarray,
+    r: int,
+    n_starts: int,
+    seed: int,
+    slm_max_iter: int,
+    em_max_iter: int,
+    em_tol: float,
+    include_baselines: bool,
+    alphas: List[float],
+    thread_limit: int,
+    slm_cfg: Dict,
+):
+    """Run one fold without printing (spawn-safe)."""
+    # Apply thread limiting again inside the worker process.
+    try:
+        from threadpoolctl import threadpool_limits
+
+        threadpool_limits(limits=int(thread_limit))
+    except Exception:
+        pass
+
+    X_train, Y_train = X[train_idx], Y[train_idx]
+    X_test, Y_test = X[test_idx], Y[test_idx]
+
+    X_train_s, Y_train_s, X_test_s, _Y_test_s, _sx, sy = _standardize_train_test(
+        X_train, Y_train, X_test, Y_test
+    )
+
+    metrics_rows: List[Dict] = []
+    calib_rows: List[Dict] = []
+
+    # --- PPLS-SLM ---
+    if bool(slm_cfg.get("verbose", False)):
+        print(f"    [fold {fold_idx + 1}] fitting PPLS-SLM/EM...", flush=True)
+
+    slm_params = _fit_ppls_params_slm(
+        X_train_s,
+        Y_train_s,
+        r=r,
+        n_starts=n_starts,
+        seed=seed + fold_idx,
+        slm_max_iter=slm_max_iter,
+        slm_optimizer=str(slm_cfg["optimizer"]),
+        slm_gtol=float(slm_cfg["gtol"]),
+        slm_xtol=float(slm_cfg["xtol"]),
+        slm_barrier_tol=float(slm_cfg["barrier_tol"]),
+        slm_constraint_slack=float(slm_cfg["constraint_slack"]),
+        slm_progress_every=int(slm_cfg["progress_every"]),
+        slm_early_stop_patience=slm_cfg.get("early_stop_patience"),
+        slm_early_stop_rel_improvement=slm_cfg.get("early_stop_rel_improvement"),
+        slm_data_start=bool(slm_cfg["data_start"]),
+        slm_verbose=bool(slm_cfg.get("verbose", False)),
+    )
+
+
+    y_pred_slm_s, Cov_slm_s = _predict_ppls(X_test_s, params=slm_params)
+    y_pred_slm = _unstandardize_y_pred(y_pred_slm_s, sy)
+
+    m_slm = compute_regression_metrics(Y_test, y_pred_slm)
+    metrics_rows.append(
+        {
+            "fold": fold_idx + 1,
+            "method": "PPLS-SLM",
+            "mse": m_slm.mse,
+            "mae": m_slm.mae,
+            "r2": m_slm.r2_mean,
+        }
+    )
+
+    Cov_slm = _unstandardize_cov_y(Cov_slm_s, sy)
+    for a in alphas:
+        lower, upper = compute_credible_intervals(y_pred_slm, Cov_slm, alpha=float(a))
+        cov = 100.0 * empirical_coverage(Y_test, lower, upper)
+        calib_rows.append({"fold": fold_idx + 1, "method": "PPLS-SLM", "alpha": float(a), "coverage": cov})
+
+    # --- PPLS-EM ---
+    em_params = _fit_ppls_params_em(
+        X_train_s,
+        Y_train_s,
+        r=r,
+        n_starts=n_starts,
+        seed=seed + fold_idx,
+        em_max_iter=em_max_iter,
+        em_tol=em_tol,
+        em_data_start=bool(slm_cfg["data_start"]),
+    )
+
+    y_pred_em_s, Cov_em_s = _predict_ppls(X_test_s, params=em_params)
+    y_pred_em = _unstandardize_y_pred(y_pred_em_s, sy)
+
+    m_em = compute_regression_metrics(Y_test, y_pred_em)
+    metrics_rows.append(
+        {
+            "fold": fold_idx + 1,
+            "method": "PPLS-EM",
+            "mse": m_em.mse,
+            "mae": m_em.mae,
+            "r2": m_em.r2_mean,
+        }
+    )
+
+    Cov_em = _unstandardize_cov_y(Cov_em_s, sy)
+    for a in alphas:
+        lower, upper = compute_credible_intervals(y_pred_em, Cov_em, alpha=float(a))
+        cov = 100.0 * empirical_coverage(Y_test, lower, upper)
+        calib_rows.append({"fold": fold_idx + 1, "method": "PPLS-EM", "alpha": float(a), "coverage": cov})
+
+    # --- Baselines ---
+    if include_baselines:
+        plsr = run_plsr_prediction(X_train, Y_train, X_test, Y_test, n_components=r)
+        m_plsr = plsr["metrics"]
+        metrics_rows.append(
+            {
+                "fold": fold_idx + 1,
+                "method": "PLSR",
+                "mse": m_plsr.mse,
+                "mae": m_plsr.mae,
+                "r2": m_plsr.r2_mean,
+            }
+        )
+
+        ridge = run_ridge_prediction(X_train, Y_train, X_test, Y_test)
+        m_ridge = ridge["metrics"]
+        metrics_rows.append(
+            {
+                "fold": fold_idx + 1,
+                "method": "Ridge",
+                "mse": m_ridge.mse,
+                "mae": m_ridge.mae,
+                "r2": m_ridge.r2_mean,
+            }
+        )
+
+    return metrics_rows, calib_rows
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  k-fold benchmark (Synthetic)
 # ─────────────────────────────────────────────────────────────────────────────
+
+
 
 def kfold_prediction_benchmark(
     X: np.ndarray,
@@ -306,9 +510,16 @@ def kfold_prediction_benchmark(
     em_max_iter: int,
     em_tol: float,
     include_baselines: bool,
+    thread_limit: int,
+    parallel_folds: bool,
+    fold_workers: int,
+    cv_heartbeat_sec: int,
+    slm_cfg: Dict,
     alphas: Optional[List[float]] = None,
     verbose: bool = True,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+
+
     import time
 
     """Run 5-fold CV and return:
@@ -328,7 +539,87 @@ def kfold_prediction_benchmark(
     metrics_rows: List[Dict] = []
     calib_rows: List[Dict] = []
 
-    for fold_idx, test_idx in enumerate(folds):
+    folds_iter = list(enumerate(folds))
+
+    if bool(parallel_folds) and int(fold_workers) > 1 and int(n_folds) > 1:
+        import multiprocessing
+        from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+
+        max_workers = max(1, min(int(fold_workers), int(n_folds)))
+        heartbeat = max(1, int(cv_heartbeat_sec))
+
+        if verbose:
+            print(f"  Running folds in parallel (workers={max_workers})...", flush=True)
+            print(f"  (heartbeat every {heartbeat}s; enable per-start logs via slm_verbose=true)", flush=True)
+
+        mp_ctx = multiprocessing.get_context("spawn")
+        futures = {}
+        t_parallel = time.time()
+
+        with ProcessPoolExecutor(max_workers=max_workers, mp_context=mp_ctx) as executor:
+            for fold_idx, test_idx in folds_iter:
+                if n_folds <= 1:
+                    train_idx = indices
+                else:
+                    train_idx = np.concatenate([folds[j] for j in range(n_folds) if j != fold_idx])
+
+                fut = executor.submit(
+                    _run_single_fold_prediction,
+                    fold_idx=fold_idx,
+                    train_idx=train_idx,
+                    test_idx=test_idx,
+                    X=X,
+                    Y=Y,
+                    r=r,
+                    n_starts=n_starts,
+                    seed=seed,
+                    slm_max_iter=slm_max_iter,
+                    em_max_iter=em_max_iter,
+                    em_tol=em_tol,
+                    include_baselines=include_baselines,
+                    alphas=alphas,
+                    thread_limit=thread_limit,
+                    slm_cfg=slm_cfg,
+                )
+                futures[fut] = fold_idx
+
+            if verbose:
+                print(f"  Submitted {len(futures)}/{n_folds} fold jobs.", flush=True)
+
+            completed = 0
+            pending = set(futures.keys())
+            last_beat = time.time()
+
+            while pending:
+                done, pending = wait(pending, timeout=heartbeat, return_when=FIRST_COMPLETED)
+
+                for fut in done:
+                    fold_done = int(futures[fut])
+                    rows_m, rows_c = fut.result()
+                    metrics_rows.extend(rows_m)
+                    calib_rows.extend(rows_c)
+                    completed += 1
+                    if verbose:
+                        print(f"  Fold {fold_done + 1}/{n_folds} done ({completed}/{n_folds}).", flush=True)
+
+                now = time.time()
+                if verbose and pending and (now - last_beat) >= heartbeat:
+                    elapsed = now - t_parallel
+                    print(
+                        f"  Still running... {completed}/{n_folds} folds done (elapsed {elapsed:.0f}s)",
+                        flush=True,
+                    )
+                    last_beat = now
+
+        if verbose:
+            print(f"  Parallel CV done in {time.time() - t_parallel:.1f}s.", flush=True)
+
+        # Skip the sequential path below.
+        folds_iter = []
+
+
+    for fold_idx, test_idx in folds_iter:
+
         if n_folds <= 1:
             train_idx = indices
         else:
@@ -359,7 +650,19 @@ def kfold_prediction_benchmark(
             n_starts=n_starts,
             seed=seed + fold_idx,
             slm_max_iter=slm_max_iter,
+            slm_optimizer=str(slm_cfg["optimizer"]),
+            slm_gtol=float(slm_cfg["gtol"]),
+            slm_xtol=float(slm_cfg["xtol"]),
+            slm_barrier_tol=float(slm_cfg["barrier_tol"]),
+            slm_constraint_slack=float(slm_cfg["constraint_slack"]),
+            slm_progress_every=int(slm_cfg["progress_every"]),
+            slm_early_stop_patience=slm_cfg.get("early_stop_patience"),
+            slm_early_stop_rel_improvement=slm_cfg.get("early_stop_rel_improvement"),
+            slm_data_start=bool(slm_cfg["data_start"]),
+            slm_verbose=bool(slm_cfg.get("verbose", True)),
         )
+
+
         if verbose:
             meta = slm_params.get("_meta", {}) if isinstance(slm_params, dict) else {}
             iters = meta.get("n_iterations")
@@ -400,7 +703,9 @@ def kfold_prediction_benchmark(
             seed=seed + fold_idx,
             em_max_iter=em_max_iter,
             em_tol=em_tol,
+            em_data_start=bool(slm_cfg["data_start"]),
         )
+
         if verbose:
             meta = em_params.get("_meta", {}) if isinstance(em_params, dict) else {}
             iters = meta.get("n_iterations")
@@ -582,17 +887,60 @@ def main():
             "em_tol",
             "plot",
             "no_baselines",
+            # speed & stability knobs
+            "parallel_folds",
+            "fold_workers",
+            "cv_heartbeat_sec",
+            "slm_optimizer",
+            "slm_gtol",
+            "slm_xtol",
+            "slm_barrier_tol",
+            "slm_constraint_slack",
+            "slm_progress_every",
+            "slm_early_stop_patience",
+            "slm_early_stop_rel_improvement",
+            "slm_data_start",
+            "slm_verbose",
         ],
+
         ctx="experiments.prediction",
     )
 
+
     # Coerce basic types
-    for k in ("thread_limit", "p", "q", "r", "n_samples", "n_folds", "n_starts", "seed", "max_iter"):
+    for k in (
+        "thread_limit",
+        "p",
+        "q",
+        "r",
+        "n_samples",
+        "n_folds",
+        "n_starts",
+        "seed",
+        "max_iter",
+        "fold_workers",
+        "cv_heartbeat_sec",
+        "slm_progress_every",
+        "slm_early_stop_patience",
+    ):
         coerce_int(pred_cfg, k, ctx="experiments.prediction")
-    for k in ("sigma_e2", "sigma_f2", "sigma_h2", "em_tol"):
+
+    for k in (
+        "sigma_e2",
+        "sigma_f2",
+        "sigma_h2",
+        "em_tol",
+        "slm_gtol",
+        "slm_xtol",
+        "slm_barrier_tol",
+        "slm_constraint_slack",
+        "slm_early_stop_rel_improvement",
+    ):
         coerce_float(pred_cfg, k, ctx="experiments.prediction")
-    for k in ("plot", "no_baselines"):
+    for k in ("plot", "no_baselines", "parallel_folds", "slm_data_start", "slm_verbose"):
         coerce_bool(pred_cfg, k, ctx="experiments.prediction")
+
+
 
     output_dir = str(pred_cfg["output_dir"])
     os.makedirs(output_dir, exist_ok=True)
@@ -627,9 +975,48 @@ def main():
     max_iter = int(pred_cfg["max_iter"])
     em_tol = float(pred_cfg["em_tol"])
 
+    parallel_folds = bool(pred_cfg["parallel_folds"])
+    fold_workers = int(pred_cfg["fold_workers"])
+    cv_heartbeat_sec = int(pred_cfg["cv_heartbeat_sec"])
+
+
+    slm_early_stop_patience = int(pred_cfg["slm_early_stop_patience"])
+    if slm_early_stop_patience <= 0:
+        slm_early_stop_patience = None
+
+    slm_early_stop_rel_improvement = float(pred_cfg["slm_early_stop_rel_improvement"])
+    if slm_early_stop_rel_improvement <= 0:
+        slm_early_stop_rel_improvement = None
+
+    slm_cfg = {
+        "optimizer": str(pred_cfg["slm_optimizer"]),
+        "gtol": float(pred_cfg["slm_gtol"]),
+        "xtol": float(pred_cfg["slm_xtol"]),
+        "barrier_tol": float(pred_cfg["slm_barrier_tol"]),
+        "constraint_slack": float(pred_cfg["slm_constraint_slack"]),
+        "progress_every": int(pred_cfg["slm_progress_every"]),
+        "early_stop_patience": slm_early_stop_patience,
+        "early_stop_rel_improvement": slm_early_stop_rel_improvement,
+        "data_start": bool(pred_cfg["slm_data_start"]),
+        "verbose": bool(pred_cfg["slm_verbose"]),
+    }
+
+
+
     print(f"  p={p_dim}, q={q_dim}, r={r}, N={n_samples}")
     print(f"  folds={n_folds}, starts={n_starts}")
+    print(f"  threads: thread_limit={int(pred_cfg['thread_limit'])}")
+    print(f"  CV: parallel_folds={parallel_folds}, fold_workers={fold_workers}, heartbeat={cv_heartbeat_sec}s")
+
     print(f"  SLM/EM: max_iter={max_iter} (spectral noise pre-estimation), tol={em_tol}")
+    print(
+        "  SLM: "
+        f"optimizer={slm_cfg['optimizer']}, "
+        f"gtol={slm_cfg['gtol']}, xtol={slm_cfg['xtol']}, barrier_tol={slm_cfg['barrier_tol']}, "
+        f"slack={slm_cfg['constraint_slack']}, data_start={slm_cfg['data_start']}, "
+        f"early_stop_patience={slm_cfg['early_stop_patience']}, early_stop_rel_improvement={slm_cfg['early_stop_rel_improvement']}"
+    )
+
     print("=" * 60)
 
     print("\nGenerating synthetic PPLS data...", flush=True)
@@ -662,9 +1049,16 @@ def main():
         em_max_iter=max_iter,
         em_tol=em_tol,
         include_baselines=(not bool(pred_cfg["no_baselines"])),
+        thread_limit=int(pred_cfg["thread_limit"]),
+        parallel_folds=parallel_folds,
+        fold_workers=fold_workers,
+        cv_heartbeat_sec=cv_heartbeat_sec,
+        slm_cfg=slm_cfg,
         alphas=alphas,
         verbose=True,
     )
+
+
 
     # Save
     metrics_per_fold.to_csv(os.path.join(output_dir, "prediction_metrics_per_fold.csv"), index=False)

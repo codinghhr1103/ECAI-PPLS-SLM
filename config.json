@@ -95,7 +95,24 @@
       "max_iter": 1000,
       "em_tol": 1e-4,
       "plot": true,
-      "no_baselines": false
+      "no_baselines": false,
+
+      "parallel_folds": true,
+      "fold_workers": 5,
+
+      "slm_optimizer": "trust-constr",
+      "slm_gtol": 0.005,
+      "slm_xtol": 0.005,
+      "slm_barrier_tol": 0.005,
+      "slm_constraint_slack": 0.005,
+      "slm_progress_every": 1,
+      "slm_early_stop_patience": 2,
+      "slm_early_stop_rel_improvement": 0.001,
+      "slm_data_start": true,
+      "slm_verbose": true,
+      "cv_heartbeat_sec": 30
+
+
     },
     "prediction_brca": {
       "thread_limit": 1,
