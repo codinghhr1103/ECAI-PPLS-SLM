@@ -100,6 +100,8 @@ def main() -> int:
     copied += int(copy_file(pred_root / "prediction_metrics_per_fold.csv", pred_syn / "prediction_metrics_per_fold.csv"))
     copied += int(copy_file(pred_root / "prediction_metrics_summary.csv", pred_syn / "prediction_metrics_summary.csv"))
     copied += int(copy_file(pred_root / "calibration_comparison.csv", pred_syn / "calibration_comparison.csv"))
+    copied += int(copy_file(pred_root / "selected_shrinkage_alpha.csv", pred_syn / "selected_shrinkage_alpha.csv"))
+
 
     # Optional plots
     copied += int(copy_file(pred_root / "calibration_plot.png", pred_syn / "calibration_plot.png"))
@@ -116,7 +118,9 @@ def main() -> int:
     copied += int(copy_file(brca_root / "brca_prediction_summary.csv", pred_brca / "brca_prediction_summary.csv"))
     copied += int(copy_file(brca_root / "brca_prediction_by_r.csv", pred_brca / "brca_prediction_by_r.csv"))
     copied += int(copy_file(brca_root / "brca_prediction_per_fold.csv", pred_brca / "brca_prediction_per_fold.csv"))
+    copied += int(copy_file(brca_root / "brca_selected_shrinkage_alpha.csv", pred_brca / "brca_selected_shrinkage_alpha.csv"))
     copied += int(copy_file(brca_root / "brca_calibration_table.csv", pred_brca / "brca_calibration_table.csv"))
+
 
 
 

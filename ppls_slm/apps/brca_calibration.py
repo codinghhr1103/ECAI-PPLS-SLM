@@ -30,10 +30,20 @@ from ppls_slm.apps.prediction import (
     empirical_coverage,
     predict_conditional_covariance,
     predict_conditional_mean,
+    select_shrinkage_alpha_cv,
 )
 
 
+def _slm_method_name(*, slm_optimizer: str, adaptive: bool) -> str:
+    opt = str(slm_optimizer).lower()
+    if opt in ("manifold", "pymanopt", "riemannian", "stiefel"):
+        return "PPLS-SLM-Manifold-Adaptive" if bool(adaptive) else "PPLS-SLM-Manifold"
+    return "PPLS-SLM-Adaptive" if bool(adaptive) else "PPLS-SLM"
+
+
+
 def load_brca_combined_raw(path: str) -> Tuple[np.ndarray, np.ndarray]:
+
     lower = path.lower()
 
     if lower.endswith(".zip"):
@@ -165,11 +175,13 @@ def _fit_slm(
 
 def _best_r_from_summary(path: str) -> int:
     df = pd.read_csv(path)
-    sub = df[df["method"].astype(str) == "PPLS-SLM"]
+    methods = df["method"].astype(str)
+    sub = df[methods.str.startswith("PPLS-SLM", na=False)]
     if sub.empty:
-        raise ValueError(f"PPLS-SLM row not found in: {path}")
+        raise ValueError(f"PPLS-SLM* row not found in: {path}")
     r = sub.iloc[0]["r"]
     return int(r)
+
 
 
 def run_calibration(
@@ -193,7 +205,11 @@ def run_calibration(
     slm_constraint_slack: float = 1e-2,
     slm_verbose: bool = False,
     slm_progress_every: int = 1,
+    slm_adaptive_shrinkage: bool = False,
+    slm_shrinkage_alpha_grid: List[float] | None = None,
+    slm_adaptive_shrinkage_folds: int = 5,
 ) -> pd.DataFrame:
+
 
     """Compute empirical coverage for element-wise credible intervals.
 
@@ -243,20 +259,38 @@ def run_calibration(
         )
 
 
-        y_pred_s = predict_conditional_mean(X_test_s, params)
-        Cov_s = predict_conditional_covariance(params)
+
+
+        shrinkage_alpha_slm = 1.0
+        if bool(slm_adaptive_shrinkage):
+            grid = slm_shrinkage_alpha_grid or [0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0, 1.5, 2.0, 3.0]
+            shrinkage_alpha_slm, _cv = select_shrinkage_alpha_cv(
+                X_train_s,
+                Y_train_s,
+                params=params,
+                alpha_grid=grid,
+                n_folds=int(slm_adaptive_shrinkage_folds),
+                seed=int(seed + fold_idx),
+            )
+
+        y_pred_s = predict_conditional_mean(X_test_s, params, shrinkage_alpha=shrinkage_alpha_slm)
+        Cov_s = predict_conditional_covariance(params, shrinkage_alpha=shrinkage_alpha_slm)
 
         y_pred = _unstandardize_y(y_pred_s, sy)
         Cov = _unstandardize_cov(Cov_s, sy)
 
-        fold_cache.append((Y_test, y_pred, Cov, int(X_train.shape[1]), int(Y_train.shape[1])))
+        fold_cache.append((Y_test, y_pred, Cov, int(X_train.shape[1]), int(Y_train.shape[1]), float(shrinkage_alpha_slm)))
+
 
     # Table with rows alpha, cols expected + fold1..foldK + mean
     rows = []
     for a in alphas:
         row = {
+            "method": slm_method,
             "Alpha": float(a),
             "Expected Coverage": f"{100.0 * (1.0 - float(a)):.2f}%",
+            "shrinkage_alpha_mean": shrinkage_alpha_mean,
+            "shrinkage_alpha_std": shrinkage_alpha_std,
             "n_folds": int(n_folds),
             "p": int(fold_cache[0][3]) if fold_cache else None,
             "q": int(fold_cache[0][4]) if fold_cache else None,
@@ -264,8 +298,10 @@ def run_calibration(
             "y_top_k": y_top_k,
         }
 
+
         covs = []
-        for fold_idx, (Y_test, y_pred, Cov, _p, _q) in enumerate(fold_cache):
+        for fold_idx, (Y_test, y_pred, Cov, _p, _q, _shrink_a) in enumerate(fold_cache):
+
             lower, upper = compute_credible_intervals(y_pred, Cov, alpha=float(a))
             cov_pct = 100.0 * empirical_coverage(Y_test, lower, upper)
             covs.append(float(cov_pct))
@@ -394,7 +430,11 @@ def main():
         slm_constraint_slack=slm_constraint_slack,
         slm_verbose=slm_verbose,
         slm_progress_every=slm_progress_every,
+        slm_adaptive_shrinkage=bool(calib_cfg.get("slm_adaptive_shrinkage", False)),
+        slm_shrinkage_alpha_grid=calib_cfg.get("slm_shrinkage_alpha_grid", None),
+        slm_adaptive_shrinkage_folds=int(calib_cfg.get("slm_adaptive_shrinkage_folds", 5)),
     )
+
 
 
 

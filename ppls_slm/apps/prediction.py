@@ -42,7 +42,8 @@ from __future__ import annotations
 import argparse
 import os
 import warnings
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
+
 
 # NOTE (Windows stability): some BLAS/LAPACK builds may hang or become extremely slow
 # on QR/SVD due to oversubscription or thread deadlocks. Defaulting to 1 thread makes
@@ -111,13 +112,27 @@ def generate_ppls_data(
 #  Prediction helpers (Property 1 / Algorithm 3)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def predict_conditional_mean(x_new: np.ndarray, params: Dict) -> np.ndarray:
-    """Compute E[y_new | x_new, params] via the conditional Gaussian formula."""
+def predict_conditional_mean(
+    x_new: np.ndarray,
+    params: Dict,
+    *,
+    shrinkage_alpha: float = 1.0,
+) -> np.ndarray:
+    """Compute E[y_new | x_new, params] via the conditional Gaussian formula.
+
+    The adaptive-shrinkage parameter alpha enters through
+
+        (W Sigma_t W^T + alpha * sigma_e^2 I)^{-1}.
+    """
     W, C, B = params["W"], params["C"], params["B"]
     Sigma_t = params["Sigma_t"]
     sigma_e2 = float(params["sigma_e2"])
 
-    Sigma_xx = W @ Sigma_t @ W.T + sigma_e2 * np.eye(W.shape[0])
+    a = float(shrinkage_alpha)
+    if not (a > 0):
+        raise ValueError(f"shrinkage_alpha must be > 0, got {a}")
+
+    Sigma_xx = W @ Sigma_t @ W.T + (a * sigma_e2) * np.eye(W.shape[0])
 
     L = np.linalg.cholesky(Sigma_xx + 1e-9 * np.eye(Sigma_xx.shape[0]))
     tmp = np.linalg.solve(L, W)
@@ -130,13 +145,26 @@ def predict_conditional_mean(x_new: np.ndarray, params: Dict) -> np.ndarray:
     return x_new @ A.T
 
 
-def predict_conditional_covariance(params: Dict) -> np.ndarray:
-    """Compute Cov[y_new | x_new, params]. The covariance is x-independent."""
+def predict_conditional_covariance(
+    params: Dict,
+    *,
+    shrinkage_alpha: float = 1.0,
+) -> np.ndarray:
+    """Compute \(\mathrm{Cov}[y_{new}\mid x_{new}]\) (x-independent).
+
+    The adaptive-shrinkage parameter \(\alpha\) enters through
+
+        \((W\Sigma_tW^\top + \alpha\,\sigma_e^2 I)^{-1}\).
+    """
     W, C, B = params["W"], params["C"], params["B"]
     Sigma_t = params["Sigma_t"]
     sigma_e2 = float(params["sigma_e2"])
     sigma_f2 = float(params["sigma_f2"])
     sigma_h2 = float(params["sigma_h2"])
+
+    a = float(shrinkage_alpha)
+    if not (a > 0):
+        raise ValueError(f"shrinkage_alpha must be > 0, got {a}")
 
     r = W.shape[1]
     q = C.shape[0]
@@ -144,7 +172,8 @@ def predict_conditional_covariance(params: Dict) -> np.ndarray:
     b = np.diag(B)
     theta_t2 = np.diag(Sigma_t)
 
-    Sigma_xx = W @ Sigma_t @ W.T + sigma_e2 * np.eye(W.shape[0])
+    sigma_eff = a * sigma_e2
+    Sigma_xx = W @ Sigma_t @ W.T + sigma_eff * np.eye(W.shape[0])
     L = np.linalg.cholesky(Sigma_xx + 1e-9 * np.eye(Sigma_xx.shape[0]))
     WtSig_inv = np.linalg.solve(L.T, np.linalg.solve(L, W))  # Sigma_xx^{-1} W (p,r)
 
@@ -158,6 +187,7 @@ def predict_conditional_covariance(params: Dict) -> np.ndarray:
     Cov = term1 - M
     Cov = (Cov + Cov.T) / 2 + 1e-9 * np.eye(q)
     return Cov
+
 
 
 def compute_credible_intervals(
@@ -179,9 +209,67 @@ def empirical_coverage(y_true: np.ndarray, lower: np.ndarray, upper: np.ndarray)
     return float(within.mean())
 
 
+def _slm_method_name_from_cfg(slm_cfg: Dict) -> str:
+    opt = str(slm_cfg.get("optimizer", "")).lower()
+    adaptive = bool(slm_cfg.get("adaptive_shrinkage", False))
+
+    if opt in ("manifold", "pymanopt", "riemannian", "stiefel"):
+        return "PPLS-SLM-Manifold-Adaptive" if adaptive else "PPLS-SLM-Manifold"
+
+    return "PPLS-SLM-Adaptive" if adaptive else "PPLS-SLM"
+
+
+def select_shrinkage_alpha_cv(
+    X_train_s: np.ndarray,
+    Y_train_s: np.ndarray,
+    *,
+    params: Dict,
+    alpha_grid: Sequence[float],
+    n_folds: int = 5,
+    seed: int = 0,
+) -> Tuple[float, pd.DataFrame]:
+    """Select alpha by inner CV using fixed PPLS parameters.
+
+    We do NOT refit PPLS per inner fold; we only vary \(\alpha\) in the prediction
+    rule, as described in the paper revision.
+
+    Returns `(alpha_star, cv_table)` where `cv_table` contains per-alpha mean MSE.
+    """
+    from sklearn.model_selection import KFold
+
+    alpha_grid = [float(a) for a in alpha_grid]
+    if not alpha_grid:
+        raise ValueError("alpha_grid must be non-empty")
+
+    n = int(X_train_s.shape[0])
+    k = int(min(max(2, int(n_folds)), n))
+
+    kf = KFold(n_splits=k, shuffle=True, random_state=int(seed))
+
+    rows: List[Dict] = []
+    for a in alpha_grid:
+        if not (a > 0):
+            continue
+        mses = []
+        for tr, va in kf.split(X_train_s):
+            X_va = X_train_s[va]
+            Y_va = Y_train_s[va]
+            Y_hat = predict_conditional_mean(X_va, params, shrinkage_alpha=float(a))
+            mses.append(float(np.mean((Y_va - Y_hat) ** 2)))
+        rows.append({"shrinkage_alpha": float(a), "mse_mean": float(np.mean(mses))})
+
+    cv_table = pd.DataFrame(rows).sort_values("shrinkage_alpha").reset_index(drop=True)
+    if cv_table.empty:
+        raise ValueError("alpha_grid produced no valid candidates (all <= 0?)")
+
+    best_row = cv_table.loc[int(cv_table["mse_mean"].idxmin())]
+    return float(best_row["shrinkage_alpha"]), cv_table
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Fold-level helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def _standardize_train_test(
     X_train: np.ndarray,
@@ -339,10 +427,12 @@ def _predict_ppls(
     X_test_s: np.ndarray,
     *,
     params: Dict,
+    shrinkage_alpha: float = 1.0,
 ):
-    y_pred_s = predict_conditional_mean(X_test_s, params)
-    Cov_s = predict_conditional_covariance(params)
+    y_pred_s = predict_conditional_mean(X_test_s, params, shrinkage_alpha=float(shrinkage_alpha))
+    Cov_s = predict_conditional_covariance(params, shrinkage_alpha=float(shrinkage_alpha))
     return y_pred_s, Cov_s
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -411,17 +501,37 @@ def _run_single_fold_prediction(
     )
 
 
-    y_pred_slm_s, Cov_slm_s = _predict_ppls(X_test_s, params=slm_params)
+
+
+    slm_method = _slm_method_name_from_cfg(slm_cfg)
+    shrinkage_alpha_slm = 1.0
+    if bool(slm_cfg.get("adaptive_shrinkage", False)):
+        alpha_grid = slm_cfg.get(
+            "shrinkage_alpha_grid",
+            [0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0, 1.5, 2.0, 3.0],
+        )
+        n_inner = int(slm_cfg.get("adaptive_shrinkage_folds", 5))
+        shrinkage_alpha_slm, _cv_table = select_shrinkage_alpha_cv(
+            X_train_s,
+            Y_train_s,
+            params=slm_params,
+            alpha_grid=alpha_grid,
+            n_folds=n_inner,
+            seed=int(seed + fold_idx),
+        )
+
+    y_pred_slm_s, Cov_slm_s = _predict_ppls(X_test_s, params=slm_params, shrinkage_alpha=shrinkage_alpha_slm)
     y_pred_slm = _unstandardize_y_pred(y_pred_slm_s, sy)
 
     m_slm = compute_regression_metrics(Y_test, y_pred_slm)
     metrics_rows.append(
         {
             "fold": fold_idx + 1,
-            "method": "PPLS-SLM",
+            "method": slm_method,
             "mse": m_slm.mse,
             "mae": m_slm.mae,
             "r2": m_slm.r2_mean,
+            "shrinkage_alpha": float(shrinkage_alpha_slm),
         }
     )
 
@@ -429,7 +539,16 @@ def _run_single_fold_prediction(
     for a in alphas:
         lower, upper = compute_credible_intervals(y_pred_slm, Cov_slm, alpha=float(a))
         cov = 100.0 * empirical_coverage(Y_test, lower, upper)
-        calib_rows.append({"fold": fold_idx + 1, "method": "PPLS-SLM", "alpha": float(a), "coverage": cov})
+        calib_rows.append(
+            {
+                "fold": fold_idx + 1,
+                "method": slm_method,
+                "alpha": float(a),
+                "coverage": cov,
+                "shrinkage_alpha": float(shrinkage_alpha_slm),
+            }
+        )
+
 
     # --- PPLS-EM ---
     em_params = _fit_ppls_params_em(
@@ -669,7 +788,24 @@ def kfold_prediction_benchmark(
             iters_s = f", iters={iters}" if iters is not None else ""
             print(f"    Done PPLS-SLM in {time.time()-_t_fit:.1f}s{iters_s}.", flush=True)
 
-        y_pred_slm_s, Cov_slm_s = _predict_ppls(X_test_s, params=slm_params)
+        slm_method = _slm_method_name_from_cfg(slm_cfg)
+        shrinkage_alpha_slm = 1.0
+        if bool(slm_cfg.get("adaptive_shrinkage", False)):
+            alpha_grid = slm_cfg.get(
+                "shrinkage_alpha_grid",
+                [0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0, 1.5, 2.0, 3.0],
+            )
+            n_inner = int(slm_cfg.get("adaptive_shrinkage_folds", 5))
+            shrinkage_alpha_slm, _cv_table = select_shrinkage_alpha_cv(
+                X_train_s,
+                Y_train_s,
+                params=slm_params,
+                alpha_grid=alpha_grid,
+                n_folds=n_inner,
+                seed=int(seed + fold_idx),
+            )
+
+        y_pred_slm_s, Cov_slm_s = _predict_ppls(X_test_s, params=slm_params, shrinkage_alpha=shrinkage_alpha_slm)
 
         y_pred_slm = _unstandardize_y_pred(y_pred_slm_s, sy)
 
@@ -677,10 +813,11 @@ def kfold_prediction_benchmark(
         metrics_rows.append(
             {
                 "fold": fold_idx + 1,
-                "method": "PPLS-SLM",
+                "method": slm_method,
                 "mse": m_slm.mse,
                 "mae": m_slm.mae,
                 "r2": m_slm.r2_mean,
+                "shrinkage_alpha": float(shrinkage_alpha_slm),
             }
         )
 
@@ -689,7 +826,16 @@ def kfold_prediction_benchmark(
         for a in alphas:
             lower, upper = compute_credible_intervals(y_pred_slm, Cov_slm, alpha=float(a))
             cov = 100.0 * empirical_coverage(Y_test, lower, upper)
-            calib_rows.append({"fold": fold_idx + 1, "method": "PPLS-SLM", "alpha": float(a), "coverage": cov})
+            calib_rows.append(
+                {
+                    "fold": fold_idx + 1,
+                    "method": slm_method,
+                    "alpha": float(a),
+                    "coverage": cov,
+                    "shrinkage_alpha": float(shrinkage_alpha_slm),
+                }
+            )
+
 
         # --- PPLS-EM ---
         if verbose:
@@ -794,17 +940,20 @@ def kfold_prediction_benchmark(
 
     calib_long = pd.DataFrame(calib_rows)
 
-    # Summary by alpha for SLM/EM
+    # Summary by alpha for SLM/EM (method name depends on slm_cfg)
+    slm_method = _slm_method_name_from_cfg(slm_cfg)
+
     calib_summary_rows = []
     for a, suba in calib_long.groupby("alpha", sort=True):
         row = {"alpha": float(a), "expected_coverage": 100.0 * (1.0 - float(a))}
-        for method in ("PPLS-SLM", "PPLS-EM"):
+        for method in (slm_method, "PPLS-EM"):
             subm = suba[suba["method"] == method]
-            row[f"{method}_mean"] = float(subm["coverage"].mean())
-            row[f"{method}_std"] = float(subm["coverage"].std(ddof=1))
+            row[f"{method}_mean"] = float(subm["coverage"].mean()) if len(subm) else float("nan")
+            row[f"{method}_std"] = float(subm["coverage"].std(ddof=1)) if len(subm) > 1 else float("nan")
         calib_summary_rows.append(row)
 
     calib_summary = pd.DataFrame(calib_summary_rows)
+
 
     return metrics_per_fold, metrics_summary, calib_summary
 
@@ -813,7 +962,7 @@ def kfold_prediction_benchmark(
 #  Visualisation (optional)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def plot_calibration(calib_summary: pd.DataFrame, output_dir: str):
+def plot_calibration(calib_summary: pd.DataFrame, output_dir: str, *, slm_method: str = "PPLS-SLM"):
     try:
         import matplotlib.pyplot as plt
     except ImportError:
@@ -821,12 +970,20 @@ def plot_calibration(calib_summary: pd.DataFrame, output_dir: str):
         return
 
     x = calib_summary["expected_coverage"].to_numpy()
-    y_slm = calib_summary["PPLS-SLM_mean"].to_numpy()
-    y_em = calib_summary["PPLS-EM_mean"].to_numpy()
+
+    slm_col = f"{slm_method}_mean"
+    if slm_col not in calib_summary.columns:
+        warnings.warn(f"Missing calibration column: {slm_col} – skipping plot.")
+        return
+
+    y_slm = calib_summary[slm_col].to_numpy()
+    y_em = calib_summary["PPLS-EM_mean"].to_numpy() if "PPLS-EM_mean" in calib_summary.columns else None
 
     fig, ax = plt.subplots(figsize=(6.5, 5))
-    ax.plot(x, y_slm, "o-", label="PPLS-SLM")
-    ax.plot(x, y_em, "s-", label="PPLS-EM")
+    ax.plot(x, y_slm, "o-", label=slm_method)
+    if y_em is not None:
+        ax.plot(x, y_em, "s-", label="PPLS-EM")
+
     ax.plot([x.min(), x.max()], [x.min(), x.max()], "k--", linewidth=1.2, label="Perfect")
 
     ax.set_xlabel("Nominal coverage (%)")
@@ -999,7 +1156,17 @@ def main():
         "early_stop_rel_improvement": slm_early_stop_rel_improvement,
         "data_start": bool(pred_cfg["slm_data_start"]),
         "verbose": bool(pred_cfg["slm_verbose"]),
+        # Adaptive shrinkage at prediction time (does not change estimation).
+        "adaptive_shrinkage": bool(pred_cfg.get("slm_adaptive_shrinkage", False)),
+        "shrinkage_alpha_grid": list(
+            pred_cfg.get(
+                "slm_shrinkage_alpha_grid",
+                [0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0, 1.5, 2.0, 3.0],
+            )
+        ),
+        "adaptive_shrinkage_folds": int(pred_cfg.get("slm_adaptive_shrinkage_folds", 5)),
     }
+
 
 
 
@@ -1065,6 +1232,18 @@ def main():
     metrics_summary.to_csv(os.path.join(output_dir, "prediction_metrics_summary.csv"), index=False)
     calib_summary.to_csv(os.path.join(output_dir, "calibration_comparison.csv"), index=False)
 
+    # Diagnostic: selected adaptive shrinkage alphas (if enabled)
+    if "shrinkage_alpha" in metrics_per_fold.columns:
+        alpha_diag = (
+            metrics_per_fold[["fold", "method", "shrinkage_alpha"]]
+            .dropna()
+            .drop_duplicates()
+            .sort_values(["method", "fold"])
+        )
+        if len(alpha_diag):
+            alpha_diag.to_csv(os.path.join(output_dir, "selected_shrinkage_alpha.csv"), index=False)
+
+
     print("\n── Prediction metrics (mean ± std across folds) ──")
     disp = metrics_summary.copy()
     for k in ("mse", "mae", "r2"):
@@ -1072,13 +1251,28 @@ def main():
     print(disp[["method", "mse", "mae", "r2"]].to_string(index=False))
 
     print("\n── Calibration summary (mean ± std, %) ──")
+    slm_method = _slm_method_name_from_cfg(slm_cfg)
     disp_c = calib_summary.copy()
-    disp_c["PPLS-SLM"] = disp_c["PPLS-SLM_mean"].map(lambda x: f"{x:.2f}") + " ± " + disp_c["PPLS-SLM_std"].map(lambda x: f"{x:.2f}")
-    disp_c["PPLS-EM"] = disp_c["PPLS-EM_mean"].map(lambda x: f"{x:.2f}") + " ± " + disp_c["PPLS-EM_std"].map(lambda x: f"{x:.2f}")
-    print(disp_c[["alpha", "expected_coverage", "PPLS-SLM", "PPLS-EM"]].to_string(index=False))
+
+    slm_mean_col = f"{slm_method}_mean"
+    slm_std_col = f"{slm_method}_std"
+    if (slm_mean_col in disp_c.columns) and (slm_std_col in disp_c.columns):
+        disp_c[slm_method] = disp_c[slm_mean_col].map(lambda x: f"{x:.2f}") + " ± " + disp_c[slm_std_col].map(lambda x: f"{x:.2f}")
+
+    if ("PPLS-EM_mean" in disp_c.columns) and ("PPLS-EM_std" in disp_c.columns):
+        disp_c["PPLS-EM"] = disp_c["PPLS-EM_mean"].map(lambda x: f"{x:.2f}") + " ± " + disp_c["PPLS-EM_std"].map(lambda x: f"{x:.2f}")
+
+    cols = ["alpha", "expected_coverage"]
+    if slm_method in disp_c.columns:
+        cols.append(slm_method)
+    if "PPLS-EM" in disp_c.columns:
+        cols.append("PPLS-EM")
+    print(disp_c[cols].to_string(index=False))
+
 
     if bool(pred_cfg["plot"]):
-        plot_calibration(calib_summary, output_dir)
+        plot_calibration(calib_summary, output_dir, slm_method=_slm_method_name_from_cfg(slm_cfg))
+
         print(f"\nSaved plot: {output_dir}/calibration_plot.png")
 
     print(f"\nResults saved to: {output_dir}/")

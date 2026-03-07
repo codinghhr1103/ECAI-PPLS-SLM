@@ -13,7 +13,8 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any, Dict, Iterable, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
 
 import pandas as pd
 import numpy as np
@@ -371,6 +372,29 @@ def _pm_makecell_float(mean: float, std: float, *, fmt: str = ".3f") -> str:
     return f"\\makecell{{{m}\\\\$\\pm${s}}}"
 
 
+def _pick_slm_method(methods: Sequence[str]) -> Optional[str]:
+    """Pick the most informative available SLM method name."""
+    methods = [str(m) for m in methods]
+    candidates = [m for m in methods if m.startswith("PPLS-SLM")]
+    if not candidates:
+        return None
+
+    priority = [
+        "PPLS-SLM-Manifold-Adaptive",
+        "PPLS-SLM-Manifold",
+        "PPLS-SLM-Adaptive",
+        "PPLS-SLM",
+    ]
+    for p in priority:
+        if p in candidates:
+            return p
+
+    return sorted(candidates)[0]
+
+
+
+
+
 def generate_prediction_synthetic_metrics_table(*, artifacts_dir: Path, out_path: Path) -> None:
     """Synthetic prediction accuracy table (MSE/MAE/R2) across 5 folds."""
     path = artifacts_dir / "prediction" / "synthetic" / "prediction_metrics_summary.csv"
@@ -379,8 +403,11 @@ def generate_prediction_synthetic_metrics_table(*, artifacts_dir: Path, out_path
 
     df = pd.read_csv(path)
 
-    order = ["PPLS-SLM", "PPLS-EM", "PLSR", "Ridge"]
     df["method"] = df["method"].astype(str)
+
+    slm_method = _pick_slm_method(df["method"].unique())
+    order = [m for m in [slm_method, "PPLS-EM", "PLSR", "Ridge"] if m is not None]
+
 
     rows = []
     for m in order:
@@ -428,6 +455,12 @@ def generate_prediction_synthetic_calibration_table(*, artifacts_dir: Path, out_
     def fmt_pct(x: float) -> str:
         return f"{float(x):.2f}\\%"
 
+    # Identify which SLM variant is present in the calibration CSV.
+    mean_cols = [c for c in df.columns if str(c).startswith("PPLS-SLM") and str(c).endswith("_mean")]
+    slm_method = _pick_slm_method([c[: -len("_mean")] for c in mean_cols]) or "PPLS-SLM"
+    slm_mean_col = f"{slm_method}_mean"
+    slm_std_col = f"{slm_method}_std"
+
     tex: list[str] = []
     tex.append(r"\setlength{\tabcolsep}{4pt}")
     tex.append(r"\begin{table}[t]\small")
@@ -436,15 +469,16 @@ def generate_prediction_synthetic_calibration_table(*, artifacts_dir: Path, out_
     tex.append(r"\label{tab:pred_synth_calib}")
     tex.append(r"\begin{tabular}{c|c|cc}")
     tex.append(r"\toprule")
-    tex.append(r"$\alpha$ & Expected & PPLS-SLM & PPLS-EM \\")
+    tex.append(rf"$\alpha$ & Expected & {_latex_escape(slm_method)} & PPLS-EM \\")
     tex.append(r"\midrule")
 
     for _, r in df.sort_values("alpha").iterrows():
         a = float(r["alpha"])
         expc = fmt_pct(r["expected_coverage"])
-        slm = f"{fmt_pct(r['PPLS-SLM_mean'])} $\\pm$ {fmt_pct(r['PPLS-SLM_std'])}"
-        em = f"{fmt_pct(r['PPLS-EM_mean'])} $\\pm$ {fmt_pct(r['PPLS-EM_std'])}"
+        slm = f"{fmt_pct(r[slm_mean_col])} $\\pm$ {fmt_pct(r[slm_std_col])}" if (slm_mean_col in r and slm_std_col in r) else "-"
+        em = f"{fmt_pct(r['PPLS-EM_mean'])} $\\pm$ {fmt_pct(r['PPLS-EM_std'])}" if ('PPLS-EM_mean' in r and 'PPLS-EM_std' in r) else "-"
         tex.append(f"{a:.2f} & {expc} & {slm} & {em} \\\\ ")
+
 
     tex.append(r"\bottomrule")
     tex.append(r"\end{tabular}")
@@ -454,7 +488,101 @@ def generate_prediction_synthetic_calibration_table(*, artifacts_dir: Path, out_
     out_path.write_text("\n".join(tex), encoding="utf-8")
 
 
+def generate_prediction_synthetic_alpha_table(*, artifacts_dir: Path, out_path: Path) -> None:
+    """Diagnostic table of selected adaptive shrinkage alpha* on synthetic data."""
+    path = artifacts_dir / "prediction" / "synthetic" / "selected_shrinkage_alpha.csv"
+    if not path.exists():
+        raise FileNotFoundError(f"missing: {path}")
+
+    df = pd.read_csv(path)
+    df["method"] = df["method"].astype(str)
+
+    slm_method = _pick_slm_method(df["method"].unique())
+    if slm_method is None:
+        raise ValueError("No PPLS-SLM* method found in selected_shrinkage_alpha.csv")
+
+    sub = df[df["method"] == slm_method].sort_values("fold")
+    vals = sub["shrinkage_alpha"].astype(float).to_numpy()
+
+    mean = float(np.mean(vals))
+    std = float(np.std(vals, ddof=1)) if len(vals) > 1 else float("nan")
+
+    fold_cell = "\\makecell{" + "\\\\".join(
+        [f"Fold {int(f)}: {float(a):.3g}" for f, a in zip(sub["fold"], vals)]
+    ) + "}"
+
+    tex: list[str] = []
+    tex.append(r"\setlength{\tabcolsep}{4pt}")
+    tex.append(r"\begin{table}[t]\small")
+    tex.append(r"\centering")
+    tex.append(r"\caption{Synthetic adaptive shrinkage diagnostics: selected $\alpha^*$ across folds.}")
+    tex.append(r"\label{tab:pred_synth_alpha}")
+    tex.append(r"\begin{tabular}{lcc}")
+    tex.append(r"\toprule")
+    tex.append(r"\textbf{Method} & \textbf{$\alpha^*$ (mean $\pm$ std)} & \textbf{Per-fold $\alpha^*$} \\")
+    tex.append(r"\midrule")
+    tex.append(rf"{_latex_escape(slm_method)} & {_pm_makecell_float(mean, std, fmt='.3g')} & {fold_cell} \\")
+    tex.append(r"\bottomrule")
+    tex.append(r"\end{tabular}")
+    tex.append(r"\end{table}")
+    tex.append("")
+
+    out_path.write_text("\n".join(tex), encoding="utf-8")
+
+
+def generate_prediction_brca_alpha_table(*, artifacts_dir: Path, out_path: Path) -> None:
+    """Diagnostic table of selected adaptive shrinkage alpha* on BRCA."""
+    diag_path = artifacts_dir / "prediction" / "brca" / "brca_selected_shrinkage_alpha.csv"
+    summary_path = artifacts_dir / "prediction" / "brca" / "brca_prediction_summary.csv"
+    if not (diag_path.exists() and summary_path.exists()):
+        raise FileNotFoundError(f"missing: {diag_path} or {summary_path}")
+
+    diag = pd.read_csv(diag_path)
+    diag["method"] = diag["method"].astype(str)
+
+    summ = pd.read_csv(summary_path)
+    summ["method"] = summ["method"].astype(str)
+
+    slm_method = _pick_slm_method(summ["method"].unique())
+    if slm_method is None:
+        raise ValueError("No PPLS-SLM* method found in brca_prediction_summary.csv")
+
+    sub_s = summ[summ["method"] == slm_method]
+    if sub_s.empty:
+        raise ValueError(f"Missing method in summary: {slm_method}")
+    r_star = int(sub_s.iloc[0]["r"])
+
+    sub_d = diag[(diag["method"] == slm_method) & (diag["r"].astype(int) == r_star)].sort_values("fold")
+    vals = sub_d["shrinkage_alpha"].astype(float).to_numpy()
+
+    mean = float(np.mean(vals)) if len(vals) else float("nan")
+    std = float(np.std(vals, ddof=1)) if len(vals) > 1 else float("nan")
+
+    fold_cell = "\\makecell{" + "\\\\".join(
+        [f"Fold {int(f)}: {float(a):.3g}" for f, a in zip(sub_d["fold"], vals)]
+    ) + "}"
+
+    tex: list[str] = []
+    tex.append(r"\setlength{\tabcolsep}{4pt}")
+    tex.append(r"\begin{table}[t]\small")
+    tex.append(r"\centering")
+    tex.append(r"\caption{BRCA adaptive shrinkage diagnostics: selected $\alpha^*$ across folds at $r^*$.}")
+    tex.append(r"\label{tab:pred_brca_alpha}")
+    tex.append(r"\begin{tabular}{lccc}")
+    tex.append(r"\toprule")
+    tex.append(r"\textbf{Method} & $r^*$ & \textbf{$\alpha^*$ (mean $\pm$ std)} & \textbf{Per-fold $\alpha^*$} \\")
+    tex.append(r"\midrule")
+    tex.append(rf"{_latex_escape(slm_method)} & {r_star} & {_pm_makecell_float(mean, std, fmt='.3g')} & {fold_cell} \\")
+    tex.append(r"\bottomrule")
+    tex.append(r"\end{tabular}")
+    tex.append(r"\end{table}")
+    tex.append("")
+
+    out_path.write_text("\n".join(tex), encoding="utf-8")
+
+
 def generate_prediction_brca_metrics_table(*, artifacts_dir: Path, out_path: Path) -> None:
+
     """BRCA prediction accuracy table at r* chosen by CV-MSE per method."""
     path = artifacts_dir / "prediction" / "brca" / "brca_prediction_summary.csv"
     if not path.exists():
@@ -464,7 +592,9 @@ def generate_prediction_brca_metrics_table(*, artifacts_dir: Path, out_path: Pat
     df["method"] = df["method"].astype(str)
     df["r"] = df["r"].astype(str)
 
-    order = ["PPLS-SLM", "PPLS-EM", "PLSR", "Ridge"]
+    slm_method = _pick_slm_method(df["method"].unique())
+    order = [m for m in [slm_method, "PPLS-EM", "PLSR", "Ridge"] if m is not None]
+
 
     tex: list[str] = []
     tex.append(r"\setlength{\tabcolsep}{4pt}")
@@ -1042,12 +1172,25 @@ def main() -> None:
     generate_prediction_synthetic_metrics_table(artifacts_dir=artifacts_dir, out_path=out_dir / "tab_prediction_synth_metrics.tex")
     generate_prediction_synthetic_calibration_table(artifacts_dir=artifacts_dir, out_path=out_dir / "tab_prediction_synth_calibration.tex")
 
+    syn_dir = artifacts_dir / "prediction" / "synthetic"
+    if (syn_dir / "selected_shrinkage_alpha.csv").exists():
+        generate_prediction_synthetic_alpha_table(artifacts_dir=artifacts_dir, out_path=out_dir / "tab_prediction_synth_alpha.tex")
+    else:
+        print(f"[SKIP] Synthetic alpha* table (missing: {syn_dir / 'selected_shrinkage_alpha.csv'})")
+
     # BRCA (optional in config; skip cleanly when artifacts are absent)
+
     brca_dir = artifacts_dir / "prediction" / "brca"
     if (brca_dir / "brca_prediction_summary.csv").exists():
         generate_prediction_brca_metrics_table(artifacts_dir=artifacts_dir, out_path=out_dir / "tab_prediction_brca_metrics.tex")
+
+        if (brca_dir / "brca_selected_shrinkage_alpha.csv").exists():
+            generate_prediction_brca_alpha_table(artifacts_dir=artifacts_dir, out_path=out_dir / "tab_prediction_brca_alpha.tex")
+        else:
+            print(f"[SKIP] BRCA alpha* table (missing: {brca_dir / 'brca_selected_shrinkage_alpha.csv'})")
     else:
         print(f"[SKIP] BRCA prediction table (missing: {brca_dir / 'brca_prediction_summary.csv'})")
+
 
     if (brca_dir / "brca_calibration_table.csv").exists():
         generate_prediction_brca_calibration_table(artifacts_dir=artifacts_dir, out_path=out_dir / "tab_prediction_brca_calibration.tex")

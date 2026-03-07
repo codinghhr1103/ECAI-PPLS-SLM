@@ -41,10 +41,20 @@ from ppls_slm.apps.prediction import (
     empirical_coverage,
     predict_conditional_covariance,
     predict_conditional_mean,
+    select_shrinkage_alpha_cv,
 )
 
 
+def _slm_method_name(*, slm_optimizer: str, adaptive: bool) -> str:
+    opt = str(slm_optimizer).lower()
+    if opt in ("manifold", "pymanopt", "riemannian", "stiefel"):
+        return "PPLS-SLM-Manifold-Adaptive" if bool(adaptive) else "PPLS-SLM-Manifold"
+    return "PPLS-SLM-Adaptive" if bool(adaptive) else "PPLS-SLM"
+
+
+
 def load_brca_combined_raw(path: str) -> Tuple[np.ndarray, np.ndarray]:
+
     """Load the bundled BRCA combined dataset without global standardisation."""
     lower = path.lower()
 
@@ -204,10 +214,11 @@ def _fit_ppls_em(X_train_s, Y_train_s, *, r: int, n_starts: int, seed: int, max_
     }
 
 
-def _predict_ppls(X_test_s, params: Dict):
-    y_pred_s = predict_conditional_mean(X_test_s, params)
-    Cov_s = predict_conditional_covariance(params)
+def _predict_ppls(X_test_s, params: Dict, *, shrinkage_alpha: float = 1.0):
+    y_pred_s = predict_conditional_mean(X_test_s, params, shrinkage_alpha=float(shrinkage_alpha))
+    Cov_s = predict_conditional_covariance(params, shrinkage_alpha=float(shrinkage_alpha))
     return y_pred_s, Cov_s
+
 
 
 def run_brca_prediction(
@@ -236,7 +247,11 @@ def run_brca_prediction(
     slm_progress_every: int = 1,
     slm_early_stop_patience: Optional[int] = None,
     slm_early_stop_rel_improvement: Optional[float] = None,
+    slm_adaptive_shrinkage: bool = False,
+    slm_shrinkage_alpha_grid: Optional[List[float]] = None,
+    slm_adaptive_shrinkage_folds: int = 5,
 ) -> pd.DataFrame:
+
 
 
     import time
@@ -246,7 +261,10 @@ def run_brca_prediction(
     indices = rng.permutation(N)
     folds = np.array_split(indices, int(n_folds))
 
+    slm_method = _slm_method_name(slm_optimizer=slm_optimizer, adaptive=slm_adaptive_shrinkage)
+
     rows: List[Dict] = []
+
 
     # Precompute fold splits and (optional) feature indices once per fold,
     # then reuse for all r values (important for speed).
@@ -316,9 +334,12 @@ def run_brca_prediction(
         for fd in fold_data:
             fold_idx = int(fd["fold_idx"])
 
-            # --- PPLS-SLM ---
+            # --- PPLS-SLM (optionally: Manifold + adaptive shrinkage) ---
             t_slm0 = time.perf_counter()
-            print(f"[PPLS-SLM] r={r} fold {fold_idx + 1}/{n_folds} (starts={slm_n_starts}, max_iter={slm_max_iter})...", flush=True)
+            print(
+                f"[{slm_method}] r={r} fold {fold_idx + 1}/{n_folds} (starts={slm_n_starts}, max_iter={slm_max_iter})...",
+                flush=True,
+            )
             slm_params = _fit_ppls_slm(
                 fd["X_train_s"],
                 fd["Y_train_s"],
@@ -339,17 +360,30 @@ def run_brca_prediction(
                 early_stop_rel_improvement=slm_early_stop_rel_improvement,
             )
 
-            y_pred_s, _Cov_s = _predict_ppls(fd["X_test_s"], slm_params)
+            shrinkage_alpha_slm = 1.0
+            if bool(slm_adaptive_shrinkage):
+                grid = slm_shrinkage_alpha_grid or [0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0, 1.5, 2.0, 3.0]
+                shrinkage_alpha_slm, _cv = select_shrinkage_alpha_cv(
+                    fd["X_train_s"],
+                    fd["Y_train_s"],
+                    params=slm_params,
+                    alpha_grid=grid,
+                    n_folds=int(slm_adaptive_shrinkage_folds),
+                    seed=int(seed + fold_idx),
+                )
+
+            y_pred_s, _Cov_s = _predict_ppls(fd["X_test_s"], slm_params, shrinkage_alpha=shrinkage_alpha_slm)
             y_pred = _unstandardize_y(y_pred_s, fd["sy"])
             m = compute_regression_metrics(fd["Y_test"], y_pred)
             rows.append(
                 {
-                    "method": "PPLS-SLM",
+                    "method": slm_method,
                     "r": int(r),
                     "fold": fold_idx + 1,
                     "mse": m.mse,
                     "mae": m.mae,
                     "r2": m.r2_mean,
+                    "shrinkage_alpha": float(shrinkage_alpha_slm),
                     "n_folds": int(n_folds),
                     "p": int(fd["X_train"].shape[1]),
                     "q": int(fd["Y_train"].shape[1]),
@@ -357,7 +391,12 @@ def run_brca_prediction(
                     "y_top_k": y_top_k,
                 }
             )
-            print(f"[PPLS-SLM] r={r} fold {fold_idx + 1}/{n_folds} done in {time.perf_counter() - t_slm0:.1f}s", flush=True)
+            a_msg = f", shrink_alpha={float(shrinkage_alpha_slm):.3g}" if bool(slm_adaptive_shrinkage) else ""
+            print(
+                f"[{slm_method}] r={r} fold {fold_idx + 1}/{n_folds} done in {time.perf_counter() - t_slm0:.1f}s{a_msg}",
+                flush=True,
+            )
+
 
             # --- PPLS-EM ---
             t_em0 = time.perf_counter()
@@ -583,7 +622,11 @@ def main():
         slm_progress_every=slm_progress_every,
         slm_early_stop_patience=slm_early_stop_patience,
         slm_early_stop_rel_improvement=slm_early_stop_rel_improvement,
+        slm_adaptive_shrinkage=bool(brca_cfg.get("slm_adaptive_shrinkage", False)),
+        slm_shrinkage_alpha_grid=brca_cfg.get("slm_shrinkage_alpha_grid", None),
+        slm_adaptive_shrinkage_folds=int(brca_cfg.get("slm_adaptive_shrinkage_folds", 5)),
     )
+
 
 
 
@@ -597,7 +640,20 @@ def main():
     df_best = _select_best_r(df_by_r)
     df_best.to_csv(os.path.join(output_dir, "brca_prediction_summary.csv"), index=False)
 
+    # Diagnostic: selected adaptive shrinkage alphas (when enabled)
+    if "shrinkage_alpha" in df.columns:
+        sub = df[df["method"].astype(str).str.startswith("PPLS-SLM", na=False)]
+        if len(sub):
+            alpha_diag = (
+                sub[["fold", "r", "method", "shrinkage_alpha"]]
+                .dropna()
+                .drop_duplicates()
+                .sort_values(["method", "r", "fold"])
+            )
+            alpha_diag.to_csv(os.path.join(output_dir, "brca_selected_shrinkage_alpha.csv"), index=False)
+
     print("\nSaved:")
+
     print(f"  {output_dir}/brca_prediction_per_fold.csv")
     print(f"  {output_dir}/brca_prediction_by_r.csv")
     print(f"  {output_dir}/brca_prediction_summary.csv")

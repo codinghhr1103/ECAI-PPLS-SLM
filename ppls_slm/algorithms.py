@@ -32,6 +32,13 @@ from .ppls_model import (
     NoiseEstimator,
 )
 
+# Optional dependency: manifold optimizer (Pymanopt-based)
+try:
+    from .slm_manifold import solve_slm_manifold_single_start
+except Exception:  # pragma: no cover
+    solve_slm_manifold_single_start = None
+
+
 
 # ======================================================================
 #  Abstract base
@@ -204,12 +211,24 @@ class ScalarLikelihoodMethod(PPLSAlgorithm):
             sigma_f2 = float(self.fixed_sigma_f2)
 
 
-        constraints = PPLSConstraints.get_inequality_constraints(
-            self.p, self.q, self.r, slack=self.constraint_slack
-        )
+
+
+        use_manifold = str(self.optimizer).lower() in ("manifold", "pymanopt", "riemannian", "stiefel")
+        if use_manifold and self.optimize_noise_variances:
+            raise ValueError(
+                "SLM-Manifold currently supports fixed-noise estimation only "
+                "(optimize_noise_variances=False)."
+            )
+
+        constraints = None
+        if not use_manifold:
+            constraints = PPLSConstraints.get_inequality_constraints(
+                self.p, self.q, self.r, slack=self.constraint_slack
+            )
 
 
         # Objective / bounds depend on whether we optimise noise variances.
+
         if self.optimize_noise_variances:
             objective = PPLSObjectiveWithNoise(self.p, self.q, self.r, S)
             bounds = PPLSConstraints.get_bounds_with_noise(self.p, self.q, self.r)
@@ -318,14 +337,41 @@ class ScalarLikelihoodMethod(PPLSAlgorithm):
         return results
 
     def _optimize_single_start(self, theta0, objective, constraints, bounds):
-        """Run one trust-constr solve.
+        """Run one SLM solve for a single starting point.
 
-        For fairness with EM/ECM (which stop by relative parameter change), we add an
-        additional early-stop criterion for SLM based on the relative change of the
-        optimisation vector between iterations.
+        - `trust-constr` (default): SciPy constrained optimization with relaxed
+          orthonormality constraints.
+        - `manifold`: Riemannian optimization on the Stiefel manifolds (exact
+          orthonormality) via Pymanopt.
+
+        For fairness with EM/ECM (which stop by relative parameter change), we also add
+        an early-stop criterion for the SciPy path based on relative change of the
+        optimisation vector.
         """
 
+        opt_name = str(self.optimizer).lower()
+        if opt_name in ("manifold", "pymanopt", "riemannian", "stiefel"):
+            if solve_slm_manifold_single_start is None:
+                raise ImportError(
+                    "Manifold optimizer requested but unavailable. "
+                    "Ensure `ppls_slm/slm_manifold.py` is importable and optional dependencies (e.g. pymanopt) are installed."
+                )
+            res = solve_slm_manifold_single_start(
+                objective,
+                theta0,
+                max_iter=self.max_iter,
+                verbosity=(1 if self.verbose else 0),
+            )
+            return {
+                "x": res.x,
+                "fun": res.fun,
+                "success": res.success,
+                "message": res.message,
+                "nit": res.nit,
+            }
+
         options = {
+
             'maxiter': self.max_iter,
             'gtol': self.gtol,
             'xtol': self.xtol,

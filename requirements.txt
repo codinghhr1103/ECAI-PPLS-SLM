@@ -3,6 +3,11 @@ numpy
 scipy
 scikit-learn
 
+# Manifold optimization (SLM-Manifold)
+pymanopt
+autograd
+
+
 # Data manipulation and analysis
 pandas
 

@@ -37,7 +37,17 @@
       "barrier_tol": 0.005,
       "constraint_slack": 0.005
     },
+    "slm_manifold": {
+      "optimizer": "manifold",
+      "max_iter": 2000,
+      "use_noise_preestimation": true,
+      "gtol": 0.005,
+      "xtol": 0.005,
+      "barrier_tol": 0.005,
+      "constraint_slack": 0.005
+    },
     "em": {
+
       "max_iter": 2000,
       "tolerance": 0.005
     },
@@ -100,8 +110,9 @@
       "parallel_folds": true,
       "fold_workers": 5,
 
-      "slm_optimizer": "trust-constr",
+      "slm_optimizer": "manifold",
       "slm_gtol": 0.005,
+
       "slm_xtol": 0.005,
       "slm_barrier_tol": 0.005,
       "slm_constraint_slack": 0.005,
@@ -110,7 +121,12 @@
       "slm_early_stop_rel_improvement": 0.001,
       "slm_data_start": true,
       "slm_verbose": true,
-      "cv_heartbeat_sec": 30
+      "cv_heartbeat_sec": 30,
+
+      "slm_adaptive_shrinkage": true,
+      "slm_shrinkage_alpha_grid": [0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0, 1.5, 2.0, 3.0],
+      "slm_adaptive_shrinkage_folds": 5
+
 
 
     },
@@ -130,8 +146,9 @@
       "em_tol": 1e-4,
       "ridge_cv": null,
 
-      "slm_optimizer": "trust-constr",
+      "slm_optimizer": "manifold",
       "slm_use_noise_preestimation": true,
+
       "slm_gtol": 0.05,
       "slm_xtol": 0.05,
       "slm_barrier_tol": 0.05,
@@ -140,9 +157,14 @@
       "slm_early_stop_patience": 2,
       "slm_early_stop_rel_improvement": 0.001,
       "slm_verbose": false,
-      "slm_progress_every": 5
+      "slm_progress_every": 5,
+
+      "slm_adaptive_shrinkage": true,
+      "slm_shrinkage_alpha_grid": [0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0, 1.5, 2.0, 3.0],
+      "slm_adaptive_shrinkage_folds": 5
     },
     "calibration_brca": {
+
       "thread_limit": 1,
       "brca_data": "application/brca_data_w_subtypes.csv.zip",
       "output_dir": "results_prediction_brca",
@@ -157,16 +179,22 @@
       "n_starts": 2,
       "max_iter": 80,
 
-      "slm_optimizer": "trust-constr",
+      "slm_optimizer": "manifold",
       "slm_use_noise_preestimation": true,
+
       "slm_gtol": 0.05,
       "slm_xtol": 0.05,
       "slm_barrier_tol": 0.05,
       "slm_initial_constr_penalty": 1.0,
       "slm_constraint_slack": 0.01,
       "slm_verbose": false,
-      "slm_progress_every": 5
+      "slm_progress_every": 5,
+
+      "slm_adaptive_shrinkage": true,
+      "slm_shrinkage_alpha_grid": [0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0, 1.5, 2.0, 3.0],
+      "slm_adaptive_shrinkage_folds": 5
     }
+
 
   }
 }
