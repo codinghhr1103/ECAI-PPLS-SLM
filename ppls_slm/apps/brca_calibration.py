@@ -95,13 +95,59 @@ def _unstandardize_cov(Cov_s, sy):
     return D @ Cov_s @ D
 
 
-def _fit_slm(X_train_s, Y_train_s, *, r: int, n_starts: int, seed: int, max_iter: int) -> Dict:
+def _top_variance_indices(M: np.ndarray, k: int | None) -> np.ndarray | None:
+    """Select top-k columns by variance (computed on training split)."""
+    if k is None:
+        return None
+    k = int(k)
+    if k <= 0 or k >= M.shape[1]:
+        return None
+
+    v = np.var(np.asarray(M, dtype=float), axis=0)
+    idx_desc = np.argsort(-v, kind="mergesort")
+    idx = np.sort(idx_desc[:k])
+    return idx
+
+
+def _fit_slm(
+
+    X_train_s,
+    Y_train_s,
+    *,
+    r: int,
+    n_starts: int,
+    seed: int,
+    max_iter: int,
+    optimizer: str,
+    use_noise_preestimation: bool,
+    gtol: float,
+    xtol: float,
+    barrier_tol: float,
+    initial_constr_penalty: float,
+    constraint_slack: float,
+    verbose: bool,
+    progress_every: int,
+) -> Dict:
     p, q = X_train_s.shape[1], Y_train_s.shape[1]
 
     init_gen = InitialPointGenerator(p=p, q=q, r=r, n_starts=n_starts, random_seed=seed)
     starting_points = init_gen.generate_starting_points()
 
-    slm = ScalarLikelihoodMethod(p=p, q=q, r=r, max_iter=int(max_iter), use_noise_preestimation=True)
+    slm = ScalarLikelihoodMethod(
+        p=p,
+        q=q,
+        r=r,
+        optimizer=str(optimizer),
+        max_iter=int(max_iter),
+        use_noise_preestimation=bool(use_noise_preestimation),
+        gtol=float(gtol),
+        xtol=float(xtol),
+        barrier_tol=float(barrier_tol),
+        initial_constr_penalty=float(initial_constr_penalty),
+        constraint_slack=float(constraint_slack),
+        verbose=bool(verbose),
+        progress_every=int(progress_every),
+    )
     res = slm.fit(X_train_s, Y_train_s, starting_points)
 
     return {
@@ -113,6 +159,8 @@ def _fit_slm(X_train_s, Y_train_s, *, r: int, n_starts: int, seed: int, max_iter
         "sigma_f2": res["sigma_f2"],
         "sigma_h2": res["sigma_h2"],
     }
+
+
 
 
 def _best_r_from_summary(path: str) -> int:
@@ -134,11 +182,74 @@ def run_calibration(
     n_starts: int,
     max_iter: int,
     alphas: List[float],
+    x_top_k: int | None = None,
+    y_top_k: int | None = None,
+    slm_optimizer: str = "trust-constr",
+    slm_use_noise_preestimation: bool = True,
+    slm_gtol: float = 1e-3,
+    slm_xtol: float = 1e-3,
+    slm_barrier_tol: float = 1e-3,
+    slm_initial_constr_penalty: float = 1.0,
+    slm_constraint_slack: float = 1e-2,
+    slm_verbose: bool = False,
+    slm_progress_every: int = 1,
 ) -> pd.DataFrame:
+
+    """Compute empirical coverage for element-wise credible intervals.
+
+    Efficiency note: fitting the PPLS-SLM model does not depend on alpha, so we fit once per fold
+    and then evaluate all alpha values on the same predictive distribution.
+    """
     N = X.shape[0]
     rng = np.random.RandomState(seed)
     indices = rng.permutation(N)
     folds = np.array_split(indices, int(n_folds))
+
+    # Fit once per fold and cache (Y_test, y_pred, Cov) on original Y scale.
+    fold_cache: list[tuple[np.ndarray, np.ndarray, np.ndarray, int, int]] = []
+
+    for fold_idx, test_idx in enumerate(folds):
+        print(f"[Calibration] fitting fold {fold_idx + 1}/{n_folds} (r={r}, starts={n_starts}, max_iter={max_iter})...", flush=True)
+        train_idx = np.concatenate([folds[j] for j in range(n_folds) if j != fold_idx])
+        X_train0, Y_train0 = X[train_idx], Y[train_idx]
+        X_test0, Y_test0 = X[test_idx], Y[test_idx]
+
+        x_idx = _top_variance_indices(X_train0, x_top_k)
+        y_idx = _top_variance_indices(Y_train0, y_top_k)
+
+        X_train = X_train0 if x_idx is None else X_train0[:, x_idx]
+        X_test = X_test0 if x_idx is None else X_test0[:, x_idx]
+        Y_train = Y_train0 if y_idx is None else Y_train0[:, y_idx]
+        Y_test = Y_test0 if y_idx is None else Y_test0[:, y_idx]
+
+        X_train_s, Y_train_s, X_test_s, _Y_test_s, _sx, sy = _standardize_train_test(X_train, Y_train, X_test, Y_test)
+
+        params = _fit_slm(
+            X_train_s,
+            Y_train_s,
+            r=r,
+            n_starts=n_starts,
+            seed=seed + fold_idx,
+            max_iter=max_iter,
+            optimizer=slm_optimizer,
+            use_noise_preestimation=slm_use_noise_preestimation,
+            gtol=slm_gtol,
+            xtol=slm_xtol,
+            barrier_tol=slm_barrier_tol,
+            initial_constr_penalty=slm_initial_constr_penalty,
+            constraint_slack=slm_constraint_slack,
+            verbose=bool(slm_verbose),
+            progress_every=int(slm_progress_every),
+        )
+
+
+        y_pred_s = predict_conditional_mean(X_test_s, params)
+        Cov_s = predict_conditional_covariance(params)
+
+        y_pred = _unstandardize_y(y_pred_s, sy)
+        Cov = _unstandardize_cov(Cov_s, sy)
+
+        fold_cache.append((Y_test, y_pred, Cov, int(X_train.shape[1]), int(Y_train.shape[1])))
 
     # Table with rows alpha, cols expected + fold1..foldK + mean
     rows = []
@@ -146,23 +257,15 @@ def run_calibration(
         row = {
             "Alpha": float(a),
             "Expected Coverage": f"{100.0 * (1.0 - float(a)):.2f}%",
+            "n_folds": int(n_folds),
+            "p": int(fold_cache[0][3]) if fold_cache else None,
+            "q": int(fold_cache[0][4]) if fold_cache else None,
+            "x_top_k": x_top_k,
+            "y_top_k": y_top_k,
         }
+
         covs = []
-
-        for fold_idx, test_idx in enumerate(folds):
-            train_idx = np.concatenate([folds[j] for j in range(n_folds) if j != fold_idx])
-            X_train, Y_train = X[train_idx], Y[train_idx]
-            X_test, Y_test = X[test_idx], Y[test_idx]
-
-            X_train_s, Y_train_s, X_test_s, _Y_test_s, _sx, sy = _standardize_train_test(X_train, Y_train, X_test, Y_test)
-            params = _fit_slm(X_train_s, Y_train_s, r=r, n_starts=n_starts, seed=seed + fold_idx, max_iter=max_iter)
-
-            y_pred_s = predict_conditional_mean(X_test_s, params)
-            Cov_s = predict_conditional_covariance(params)
-
-            y_pred = _unstandardize_y(y_pred_s, sy)
-            Cov = _unstandardize_cov(Cov_s, sy)
-
+        for fold_idx, (Y_test, y_pred, Cov, _p, _q) in enumerate(fold_cache):
             lower, upper = compute_credible_intervals(y_pred, Cov, alpha=float(a))
             cov_pct = 100.0 * empirical_coverage(Y_test, lower, upper)
             covs.append(float(cov_pct))
@@ -172,6 +275,7 @@ def run_calibration(
         rows.append(row)
 
     return pd.DataFrame(rows)
+
 
 
 def parse_args():
@@ -203,12 +307,12 @@ def main():
             "prediction_summary",
             "seed",
             "n_folds",
-            "r",
             "n_starts",
             "max_iter",
         ],
         ctx="experiments.calibration_brca",
     )
+
 
     for k in ("thread_limit", "seed", "n_folds", "n_starts", "max_iter"):
         coerce_int(calib_cfg, k, ctx="experiments.calibration_brca")
@@ -236,6 +340,40 @@ def main():
     print(f"Using r={r} for calibration")
 
     alphas = [0.05, 0.10, 0.15, 0.20, 0.25]
+
+    # Feature screening defaults (auto-enable for BRCA if not specified).
+    x_top_k_raw = calib_cfg.get("x_top_k", None)
+    x_top_k = None if x_top_k_raw in (None, "none", "None", "null") else int(x_top_k_raw)
+    y_top_k_raw = calib_cfg.get("y_top_k", None)
+    y_top_k = None if y_top_k_raw in (None, "none", "None", "null") else int(y_top_k_raw)
+
+    if x_top_k is None:
+        x_top_k = min(60, int(X.shape[1]))
+    if y_top_k is None:
+        y_top_k = min(60, int(Y.shape[1]))
+
+    # SLM knobs (defaults are looser for BRCA runtime).
+    slm_optimizer = str(calib_cfg.get("slm_optimizer", "trust-constr"))
+    slm_use_noise_preestimation = bool(calib_cfg.get("slm_use_noise_preestimation", True))
+    slm_gtol = float(calib_cfg.get("slm_gtol", 0.05))
+    slm_xtol = float(calib_cfg.get("slm_xtol", 0.05))
+    slm_barrier_tol = float(calib_cfg.get("slm_barrier_tol", 0.05))
+    slm_initial_constr_penalty = float(calib_cfg.get("slm_initial_constr_penalty", 1.0))
+    slm_constraint_slack = float(calib_cfg.get("slm_constraint_slack", 0.01))
+
+    slm_verbose = bool(calib_cfg.get("slm_verbose", False))
+    slm_progress_every = int(calib_cfg.get("slm_progress_every", 5))
+
+    print(
+        "Config (calibration_brca): "
+        f"n_folds={int(calib_cfg['n_folds'])}, n_starts={int(calib_cfg['n_starts'])}, max_iter={int(calib_cfg['max_iter'])}, "
+        f"x_top_k={x_top_k}, y_top_k={y_top_k}, "
+        f"slm_optimizer={slm_optimizer}, slm_gtol={slm_gtol}, slm_xtol={slm_xtol}, slm_barrier_tol={slm_barrier_tol}, slm_constraint_slack={slm_constraint_slack}, "
+        f"slm_verbose={slm_verbose}, slm_progress_every={slm_progress_every}",
+        flush=True,
+    )
+
+
     table = run_calibration(
         X,
         Y,
@@ -245,7 +383,21 @@ def main():
         n_starts=int(calib_cfg["n_starts"]),
         max_iter=int(calib_cfg["max_iter"]),
         alphas=alphas,
+        x_top_k=x_top_k,
+        y_top_k=y_top_k,
+        slm_optimizer=slm_optimizer,
+        slm_use_noise_preestimation=slm_use_noise_preestimation,
+        slm_gtol=slm_gtol,
+        slm_xtol=slm_xtol,
+        slm_barrier_tol=slm_barrier_tol,
+        slm_initial_constr_penalty=slm_initial_constr_penalty,
+        slm_constraint_slack=slm_constraint_slack,
+        slm_verbose=slm_verbose,
+        slm_progress_every=slm_progress_every,
     )
+
+
+
 
     out_csv = os.path.join(output_dir, "brca_calibration_table.csv")
     table.to_csv(out_csv, index=False)

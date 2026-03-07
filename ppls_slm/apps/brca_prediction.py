@@ -108,13 +108,67 @@ def _unstandardize_cov(Cov_s, sy):
     return D @ Cov_s @ D
 
 
-def _fit_ppls_slm(X_train_s, Y_train_s, *, r: int, n_starts: int, seed: int, max_iter: int) -> Dict:
+def _top_variance_indices(M: np.ndarray, k: Optional[int]) -> Optional[np.ndarray]:
+    """Select top-k columns by variance.
+
+    IMPORTANT: This should be computed on the training split only.
+    """
+    if k is None:
+        return None
+    k = int(k)
+    if k <= 0 or k >= M.shape[1]:
+        return None
+
+    v = np.var(np.asarray(M, dtype=float), axis=0)
+    # Deterministic tie-breaking by column index via stable sort.
+    idx_desc = np.argsort(-v, kind="mergesort")
+    idx = np.sort(idx_desc[:k])
+    return idx
+
+
+def _fit_ppls_slm(
+
+    X_train_s,
+    Y_train_s,
+    *,
+    r: int,
+    n_starts: int,
+    seed: int,
+    max_iter: int,
+    optimizer: str = "trust-constr",
+    use_noise_preestimation: bool = True,
+    gtol: float = 1e-3,
+    xtol: float = 1e-3,
+    barrier_tol: float = 1e-3,
+    initial_constr_penalty: float = 1.0,
+    constraint_slack: float = 1e-2,
+    verbose: bool = False,
+    progress_every: int = 1,
+    early_stop_patience: Optional[int] = None,
+    early_stop_rel_improvement: Optional[float] = None,
+) -> Dict:
     p, q = X_train_s.shape[1], Y_train_s.shape[1]
 
     init_gen = InitialPointGenerator(p=p, q=q, r=r, n_starts=n_starts, random_seed=seed)
     starting_points = init_gen.generate_starting_points()
 
-    slm = ScalarLikelihoodMethod(p=p, q=q, r=r, max_iter=int(max_iter), use_noise_preestimation=True)
+    slm = ScalarLikelihoodMethod(
+        p=p,
+        q=q,
+        r=r,
+        optimizer=str(optimizer),
+        max_iter=int(max_iter),
+        use_noise_preestimation=bool(use_noise_preestimation),
+        gtol=float(gtol),
+        xtol=float(xtol),
+        barrier_tol=float(barrier_tol),
+        initial_constr_penalty=float(initial_constr_penalty),
+        constraint_slack=float(constraint_slack),
+        verbose=bool(verbose),
+        progress_every=int(progress_every),
+        early_stop_patience=early_stop_patience,
+        early_stop_rel_improvement=early_stop_rel_improvement,
+    )
     res = slm.fit(X_train_s, Y_train_s, starting_points)
 
     return {
@@ -126,6 +180,8 @@ def _fit_ppls_slm(X_train_s, Y_train_s, *, r: int, n_starts: int, seed: int, max
         "sigma_f2": res["sigma_f2"],
         "sigma_h2": res["sigma_h2"],
     }
+
+
 
 
 def _fit_ppls_em(X_train_s, Y_train_s, *, r: int, n_starts: int, seed: int, max_iter: int, tol: float) -> Dict:
@@ -166,7 +222,25 @@ def run_brca_prediction(
     em_n_starts: int,
     em_max_iter: int,
     em_tol: float,
+    ridge_cv: Optional[int] = None,
+    x_top_k: Optional[int] = None,
+    y_top_k: Optional[int] = None,
+    slm_optimizer: str = "trust-constr",
+    slm_use_noise_preestimation: bool = True,
+    slm_gtol: float = 1e-3,
+    slm_xtol: float = 1e-3,
+    slm_barrier_tol: float = 1e-3,
+    slm_initial_constr_penalty: float = 1.0,
+    slm_constraint_slack: float = 1e-2,
+    slm_verbose: bool = False,
+    slm_progress_every: int = 1,
+    slm_early_stop_patience: Optional[int] = None,
+    slm_early_stop_rel_improvement: Optional[float] = None,
 ) -> pd.DataFrame:
+
+
+    import time
+
     N = X.shape[0]
     rng = np.random.RandomState(seed)
     indices = rng.permutation(N)
@@ -174,44 +248,166 @@ def run_brca_prediction(
 
     rows: List[Dict] = []
 
-    # Ridge does not depend on r
+    # Precompute fold splits and (optional) feature indices once per fold,
+    # then reuse for all r values (important for speed).
+    fold_data: list[dict] = []
     for fold_idx, test_idx in enumerate(folds):
         train_idx = np.concatenate([folds[j] for j in range(n_folds) if j != fold_idx])
-        X_train, Y_train = X[train_idx], Y[train_idx]
-        X_test, Y_test = X[test_idx], Y[test_idx]
 
-        ridge = run_ridge_prediction(X_train, Y_train, X_test, Y_test)
+        X_train0, Y_train0 = X[train_idx], Y[train_idx]
+        X_test0, Y_test0 = X[test_idx], Y[test_idx]
+
+        x_idx = _top_variance_indices(X_train0, x_top_k)
+        y_idx = _top_variance_indices(Y_train0, y_top_k)
+
+        X_train = X_train0 if x_idx is None else X_train0[:, x_idx]
+        X_test = X_test0 if x_idx is None else X_test0[:, x_idx]
+        Y_train = Y_train0 if y_idx is None else Y_train0[:, y_idx]
+        Y_test = Y_test0 if y_idx is None else Y_test0[:, y_idx]
+
+        # Standardize once per fold for PPLS-based methods.
+        X_train_s, Y_train_s, X_test_s, _Y_test_s, _sx, sy = _standardize_train_test(X_train, Y_train, X_test, Y_test)
+
+        fold_data.append(
+            {
+                "fold_idx": fold_idx,
+                "X_train": X_train,
+                "Y_train": Y_train,
+                "X_test": X_test,
+                "Y_test": Y_test,
+                "X_train_s": X_train_s,
+                "Y_train_s": Y_train_s,
+                "X_test_s": X_test_s,
+                "sy": sy,
+            }
+        )
+
+    # Ridge baseline (does not depend on r)
+    # NOTE: For BRCA, doing an inner K-fold CV *per output dimension* is extremely expensive.
+    # Default is generalized CV (ridge_cv=None).
+    for fd in fold_data:
+        fold_idx = int(fd["fold_idx"])
+        t0 = time.perf_counter()
+        print(f"[Ridge] fold {fold_idx + 1}/{n_folds} (RidgeCV cv={ridge_cv})...", flush=True)
+
+        ridge = run_ridge_prediction(fd["X_train"], fd["Y_train"], fd["X_test"], fd["Y_test"], cv=ridge_cv)
         m = ridge["metrics"]
-        rows.append({"method": "Ridge", "r": "-", "fold": fold_idx + 1, "mse": m.mse, "mae": m.mae, "r2": m.r2_mean})
+
+        rows.append(
+            {
+                "method": "Ridge",
+                "r": "-",
+                "fold": fold_idx + 1,
+                "mse": m.mse,
+                "mae": m.mae,
+                "r2": m.r2_mean,
+                "n_folds": int(n_folds),
+                "p": int(fd["X_train"].shape[1]),
+                "q": int(fd["Y_train"].shape[1]),
+                "x_top_k": x_top_k,
+                "y_top_k": y_top_k,
+            }
+        )
+
+        print(f"[Ridge] fold {fold_idx + 1}/{n_folds} done in {time.perf_counter() - t0:.1f}s", flush=True)
 
     # Methods that depend on r
     for r in r_grid:
-        for fold_idx, test_idx in enumerate(folds):
-            train_idx = np.concatenate([folds[j] for j in range(n_folds) if j != fold_idx])
-            X_train, Y_train = X[train_idx], Y[train_idx]
-            X_test, Y_test = X[test_idx], Y[test_idx]
+        for fd in fold_data:
+            fold_idx = int(fd["fold_idx"])
 
             # --- PPLS-SLM ---
-            X_train_s, Y_train_s, X_test_s, _Y_test_s, _sx, sy = _standardize_train_test(X_train, Y_train, X_test, Y_test)
-            slm_params = _fit_ppls_slm(X_train_s, Y_train_s, r=r, n_starts=slm_n_starts, seed=seed + fold_idx, max_iter=slm_max_iter)
-            y_pred_s, _Cov_s = _predict_ppls(X_test_s, slm_params)
-            y_pred = _unstandardize_y(y_pred_s, sy)
-            m = compute_regression_metrics(Y_test, y_pred)
-            rows.append({"method": "PPLS-SLM", "r": int(r), "fold": fold_idx + 1, "mse": m.mse, "mae": m.mae, "r2": m.r2_mean})
+            t_slm0 = time.perf_counter()
+            print(f"[PPLS-SLM] r={r} fold {fold_idx + 1}/{n_folds} (starts={slm_n_starts}, max_iter={slm_max_iter})...", flush=True)
+            slm_params = _fit_ppls_slm(
+                fd["X_train_s"],
+                fd["Y_train_s"],
+                r=r,
+                n_starts=slm_n_starts,
+                seed=seed + fold_idx,
+                max_iter=slm_max_iter,
+                optimizer=slm_optimizer,
+                use_noise_preestimation=slm_use_noise_preestimation,
+                gtol=slm_gtol,
+                xtol=slm_xtol,
+                barrier_tol=slm_barrier_tol,
+                initial_constr_penalty=slm_initial_constr_penalty,
+                constraint_slack=slm_constraint_slack,
+                verbose=bool(slm_verbose),
+                progress_every=int(slm_progress_every),
+                early_stop_patience=slm_early_stop_patience,
+                early_stop_rel_improvement=slm_early_stop_rel_improvement,
+            )
+
+            y_pred_s, _Cov_s = _predict_ppls(fd["X_test_s"], slm_params)
+            y_pred = _unstandardize_y(y_pred_s, fd["sy"])
+            m = compute_regression_metrics(fd["Y_test"], y_pred)
+            rows.append(
+                {
+                    "method": "PPLS-SLM",
+                    "r": int(r),
+                    "fold": fold_idx + 1,
+                    "mse": m.mse,
+                    "mae": m.mae,
+                    "r2": m.r2_mean,
+                    "n_folds": int(n_folds),
+                    "p": int(fd["X_train"].shape[1]),
+                    "q": int(fd["Y_train"].shape[1]),
+                    "x_top_k": x_top_k,
+                    "y_top_k": y_top_k,
+                }
+            )
+            print(f"[PPLS-SLM] r={r} fold {fold_idx + 1}/{n_folds} done in {time.perf_counter() - t_slm0:.1f}s", flush=True)
 
             # --- PPLS-EM ---
-            em_params = _fit_ppls_em(X_train_s, Y_train_s, r=r, n_starts=em_n_starts, seed=seed + fold_idx, max_iter=em_max_iter, tol=em_tol)
-            y_pred_s, _Cov_s = _predict_ppls(X_test_s, em_params)
-            y_pred = _unstandardize_y(y_pred_s, sy)
-            m = compute_regression_metrics(Y_test, y_pred)
-            rows.append({"method": "PPLS-EM", "r": int(r), "fold": fold_idx + 1, "mse": m.mse, "mae": m.mae, "r2": m.r2_mean})
+            t_em0 = time.perf_counter()
+            print(f"[PPLS-EM] r={r} fold {fold_idx + 1}/{n_folds} (starts={em_n_starts}, max_iter={em_max_iter})...", flush=True)
+            em_params = _fit_ppls_em(fd["X_train_s"], fd["Y_train_s"], r=r, n_starts=em_n_starts, seed=seed + fold_idx, max_iter=em_max_iter, tol=em_tol)
+            y_pred_s, _Cov_s = _predict_ppls(fd["X_test_s"], em_params)
+            y_pred = _unstandardize_y(y_pred_s, fd["sy"])
+            m = compute_regression_metrics(fd["Y_test"], y_pred)
+            rows.append(
+                {
+                    "method": "PPLS-EM",
+                    "r": int(r),
+                    "fold": fold_idx + 1,
+                    "mse": m.mse,
+                    "mae": m.mae,
+                    "r2": m.r2_mean,
+                    "n_folds": int(n_folds),
+                    "p": int(fd["X_train"].shape[1]),
+                    "q": int(fd["Y_train"].shape[1]),
+                    "x_top_k": x_top_k,
+                    "y_top_k": y_top_k,
+                }
+            )
+            print(f"[PPLS-EM] r={r} fold {fold_idx + 1}/{n_folds} done in {time.perf_counter() - t_em0:.1f}s", flush=True)
 
             # --- PLSR ---
-            plsr = run_plsr_prediction(X_train, Y_train, X_test, Y_test, n_components=r)
+            t_pls0 = time.perf_counter()
+            print(f"[PLSR] r={r} fold {fold_idx + 1}/{n_folds}...", flush=True)
+            plsr = run_plsr_prediction(fd["X_train"], fd["Y_train"], fd["X_test"], fd["Y_test"], n_components=r)
             m = plsr["metrics"]
-            rows.append({"method": "PLSR", "r": int(r), "fold": fold_idx + 1, "mse": m.mse, "mae": m.mae, "r2": m.r2_mean})
+            rows.append(
+                {
+                    "method": "PLSR",
+                    "r": int(r),
+                    "fold": fold_idx + 1,
+                    "mse": m.mse,
+                    "mae": m.mae,
+                    "r2": m.r2_mean,
+                    "n_folds": int(n_folds),
+                    "p": int(fd["X_train"].shape[1]),
+                    "q": int(fd["Y_train"].shape[1]),
+                    "x_top_k": x_top_k,
+                    "y_top_k": y_top_k,
+                }
+            )
+            print(f"[PLSR] r={r} fold {fold_idx + 1}/{n_folds} done in {time.perf_counter() - t_pls0:.1f}s", flush=True)
 
     return pd.DataFrame(rows)
+
+
 
 
 def _aggregate_by_r(df: pd.DataFrame) -> pd.DataFrame:
@@ -249,7 +445,13 @@ def _select_best_r(df_by_r: pd.DataFrame) -> pd.DataFrame:
 def parse_args():
     p = argparse.ArgumentParser(description="BRCA prediction benchmark (5-fold CV)")
     p.add_argument("--config", type=str, required=True, help="Path to config JSON (single source of truth)")
+    p.add_argument(
+        "--smoke",
+        action="store_true",
+        help="Run a very small/fast configuration (for debugging the pipeline)",
+    )
     return p.parse_args()
+
 
 
 def main():
@@ -303,6 +505,59 @@ def main():
     X, Y = load_brca_combined_raw(str(brca_cfg["brca_data"]))
     print(f"Loaded BRCA: X={X.shape}, Y={Y.shape}")
 
+    ridge_cv_raw = brca_cfg.get("ridge_cv", None)
+    ridge_cv = None if ridge_cv_raw in (None, "none", "None", "null") else int(ridge_cv_raw)
+
+    # SLM knobs (defaults here are *deliberately* looser for BRCA to keep runtime manageable)
+    slm_verbose = bool(brca_cfg.get("slm_verbose", False))
+    slm_progress_every = int(brca_cfg.get("slm_progress_every", 5))
+    slm_early_stop_patience = brca_cfg.get("slm_early_stop_patience", 2)
+    slm_early_stop_rel_improvement = brca_cfg.get("slm_early_stop_rel_improvement", 0.001)
+
+    slm_optimizer = str(brca_cfg.get("slm_optimizer", "trust-constr"))
+    slm_use_noise_preestimation = bool(brca_cfg.get("slm_use_noise_preestimation", True))
+    slm_gtol = float(brca_cfg.get("slm_gtol", 0.05))
+    slm_xtol = float(brca_cfg.get("slm_xtol", 0.05))
+    slm_barrier_tol = float(brca_cfg.get("slm_barrier_tol", 0.05))
+    slm_initial_constr_penalty = float(brca_cfg.get("slm_initial_constr_penalty", 1.0))
+    slm_constraint_slack = float(brca_cfg.get("slm_constraint_slack", 0.01))
+
+    # Feature screening (no leakage: indices computed on training folds only).
+    # If not provided, we auto-enable a moderate top-variance screen for BRCA.
+    x_top_k_raw = brca_cfg.get("x_top_k", None)
+    x_top_k = None if x_top_k_raw in (None, "none", "None", "null") else int(x_top_k_raw)
+    y_top_k_raw = brca_cfg.get("y_top_k", None)
+    y_top_k = None if y_top_k_raw in (None, "none", "None", "null") else int(y_top_k_raw)
+
+    if x_top_k is None:
+        x_top_k = min(60, int(X.shape[1]))
+    if y_top_k is None:
+        y_top_k = min(60, int(Y.shape[1]))
+
+
+    if args.smoke:
+        # Minimal settings that should finish quickly and validate the end-to-end pipeline.
+        r_grid = r_grid[:1]
+        brca_cfg["n_folds"] = min(int(brca_cfg["n_folds"]), 2)
+        brca_cfg["n_starts"] = min(int(brca_cfg["n_starts"]), 2)
+        brca_cfg["max_iter"] = min(int(brca_cfg["max_iter"]), 50)
+        x_top_k = 30
+        y_top_k = 30
+        slm_verbose = True
+        slm_progress_every = 1
+        print("[SMOKE] overriding config for a fast debug run", flush=True)
+
+    print(
+        "Config (prediction_brca): "
+        f"n_folds={int(brca_cfg['n_folds'])}, r_grid={r_grid}, n_starts={int(brca_cfg['n_starts'])}, max_iter={int(brca_cfg['max_iter'])}, "
+        f"ridge_cv={ridge_cv}, x_top_k={x_top_k}, y_top_k={y_top_k}, "
+        f"slm_optimizer={slm_optimizer}, slm_gtol={slm_gtol}, slm_xtol={slm_xtol}, slm_barrier_tol={slm_barrier_tol}, slm_constraint_slack={slm_constraint_slack}, "
+        f"slm_verbose={slm_verbose}, slm_progress_every={slm_progress_every}, "
+        f"slm_early_stop_patience={slm_early_stop_patience}, slm_early_stop_rel_improvement={slm_early_stop_rel_improvement}",
+        flush=True,
+    )
+
+
     df = run_brca_prediction(
         X,
         Y,
@@ -314,7 +569,25 @@ def main():
         em_n_starts=int(brca_cfg["n_starts"]),
         em_max_iter=int(brca_cfg["max_iter"]),
         em_tol=float(brca_cfg["em_tol"]),
+        ridge_cv=ridge_cv,
+        x_top_k=x_top_k,
+        y_top_k=y_top_k,
+        slm_optimizer=slm_optimizer,
+        slm_use_noise_preestimation=slm_use_noise_preestimation,
+        slm_gtol=slm_gtol,
+        slm_xtol=slm_xtol,
+        slm_barrier_tol=slm_barrier_tol,
+        slm_initial_constr_penalty=slm_initial_constr_penalty,
+        slm_constraint_slack=slm_constraint_slack,
+        slm_verbose=slm_verbose,
+        slm_progress_every=slm_progress_every,
+        slm_early_stop_patience=slm_early_stop_patience,
+        slm_early_stop_rel_improvement=slm_early_stop_rel_improvement,
     )
+
+
+
+
 
     df.to_csv(os.path.join(output_dir, "brca_prediction_per_fold.csv"), index=False)
 

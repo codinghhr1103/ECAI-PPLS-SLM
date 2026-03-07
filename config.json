@@ -71,8 +71,8 @@
       "speed": true,
       "association": true,
       "prediction": true,
-      "brca_prediction": false,
-      "brca_calibration": false,
+      "brca_prediction": true,
+      "brca_calibration": true,
       "sync_artifacts": true
     },
     "association": {
@@ -121,9 +121,26 @@
       "seed": 42,
       "n_folds": 5,
       "r_grid": "3,5,8,10",
-      "n_starts": 8,
-      "max_iter": 1000,
-      "em_tol": 1e-4
+
+      "x_top_k": 60,
+      "y_top_k": 60,
+
+      "n_starts": 2,
+      "max_iter": 80,
+      "em_tol": 1e-4,
+      "ridge_cv": null,
+
+      "slm_optimizer": "trust-constr",
+      "slm_use_noise_preestimation": true,
+      "slm_gtol": 0.05,
+      "slm_xtol": 0.05,
+      "slm_barrier_tol": 0.05,
+      "slm_initial_constr_penalty": 1.0,
+      "slm_constraint_slack": 0.01,
+      "slm_early_stop_patience": 2,
+      "slm_early_stop_rel_improvement": 0.001,
+      "slm_verbose": false,
+      "slm_progress_every": 5
     },
     "calibration_brca": {
       "thread_limit": 1,
@@ -133,9 +150,24 @@
       "seed": 42,
       "n_folds": 5,
       "r": null,
-      "n_starts": 8,
-      "max_iter": 1000
+
+      "x_top_k": 60,
+      "y_top_k": 60,
+
+      "n_starts": 2,
+      "max_iter": 80,
+
+      "slm_optimizer": "trust-constr",
+      "slm_use_noise_preestimation": true,
+      "slm_gtol": 0.05,
+      "slm_xtol": 0.05,
+      "slm_barrier_tol": 0.05,
+      "slm_initial_constr_penalty": 1.0,
+      "slm_constraint_slack": 0.01,
+      "slm_verbose": false,
+      "slm_progress_every": 5
     }
+
   }
 }
 

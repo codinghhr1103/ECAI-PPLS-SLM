@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Tuple
 
 import pandas as pd
+import numpy as np
+
 
 
 def _latex_escape(s: str) -> str:
@@ -483,7 +485,8 @@ def generate_prediction_brca_metrics_table(*, artifacts_dir: Path, out_path: Pat
         mse = _pm_makecell_float(r0["mse_mean"], r0["mse_std"], fmt=".4g")
         mae = _pm_makecell_float(r0["mae_mean"], r0["mae_std"], fmt=".4g")
         r2 = _pm_makecell_float(r0["r2_mean"], r0["r2_std"], fmt=".4g")
-        tex.append(f"{m} & {str(r0['r'])} & {mse} & {mae} & {r2} \\")
+        tex.append(f"{m} & {str(r0['r'])} & {mse} & {mae} & {r2} \\\\ ")
+
 
     tex.append(r"\bottomrule")
     tex.append(r"\end{tabular}")
@@ -520,7 +523,8 @@ def generate_prediction_brca_calibration_table(*, artifacts_dir: Path, out_path:
         expc = _latex_escape(str(r["Expected Coverage"]))
         vals = [_latex_escape(str(r[c])) for c in folds]
         mean = _latex_escape(str(r["Mean"]))
-        tex.append(f"{a:.2f} & {expc} & " + " & ".join(vals) + f" & {mean} \\")
+        tex.append(f"{a:.2f} & {expc} & " + " & ".join(vals) + f" & {mean} \\\\ ")
+
 
     tex.append(r"\bottomrule")
     tex.append(r"\end{tabular}")
@@ -528,6 +532,182 @@ def generate_prediction_brca_calibration_table(*, artifacts_dir: Path, out_path:
     tex.append("")
 
     out_path.write_text("\n".join(tex), encoding="utf-8")
+
+
+# -----------------------------------------------------------------------------
+#  Model selection (latent dimension r)
+# -----------------------------------------------------------------------------
+
+def _format_sci_tex(x: Any, *, sig: int = 3) -> str:
+    """Format a float as LaTeX-friendly scientific notation.
+
+    Examples:
+      12345 -> $1.23\times 10^{4}$
+      0.0012 -> $1.20\times 10^{-3}$
+
+    Keeps plain decimal for moderate magnitudes.
+    """
+
+    try:
+        xf = float(x)
+    except Exception:
+        return _latex_escape(str(x))
+
+    if not pd.isna(xf) and np.isfinite(xf):
+        ax = abs(xf)
+        if (ax == 0.0) or (1e-2 <= ax < 1e4):
+            # Plain number
+            return f"{xf:.4g}"
+
+        s = f"{xf:.{sig}e}"
+        m_s, e_s = s.split("e")
+        e = int(e_s)
+        return rf"${m_s}\times 10^{{{e}}}$"
+
+    return "--"
+
+
+def generate_model_selection_synthetic_table(*, artifacts_dir: Path, out_path: Path) -> None:
+    """Synthetic r-selection summary table (accuracy + selection distribution)."""
+
+    path = artifacts_dir / "model_selection" / "synthetic" / "selection_accuracy_table.csv"
+    if not path.exists():
+        raise FileNotFoundError(f"missing: {path}")
+
+    df = pd.read_csv(path)
+
+    # Expect columns: N, r_true, method, selection_distribution, accuracy
+    need = {"N", "r_true", "method", "selection_distribution", "accuracy"}
+    missing = need - set(df.columns)
+    if missing:
+        raise ValueError(f"Unexpected synthetic selection table columns; missing={sorted(missing)}")
+
+    df = df.copy()
+    df["N"] = df["N"].astype(int)
+    df["r_true"] = df["r_true"].astype(int)
+    df["method"] = df["method"].astype(str)
+
+    # Stable ordering: N blocks, then BIC before CV.
+    method_order = {"BIC": 0, "CV": 1}
+    df["_mord"] = df["method"].map(lambda s: method_order.get(str(s).upper(), 99))
+    df = df.sort_values(["N", "_mord"]).drop(columns=["_mord"])
+
+    def fmt_pct(x: Any) -> str:
+        try:
+            return f"{100.0 * float(x):.0f}\\%"
+        except Exception:
+            return _latex_escape(str(x))
+
+    # Pull trial count from artifacts when available.
+    M = 20
+    if "n_trials" in df.columns:
+        try:
+            M = int(df["n_trials"].iloc[0])
+        except Exception:
+            M = 20
+
+    tex: list[str] = []
+    tex.append(r"\begin{table}[t]\small")
+    tex.append(r"\centering")
+    tex.append(rf"\caption{{Synthetic latent-dimension selection accuracy over $M={M}$ trials (lower is better for BIC/CV criteria; here we report selection frequency and accuracy).}}")
+
+    tex.append(r"\label{tab:model_selection_synth}")
+    tex.append(r"\setlength{\tabcolsep}{3pt}")
+    tex.append(r"\renewcommand{\arraystretch}{1.15}")
+    tex.append(r"\begin{tabular}{ccclc}")
+    tex.append(r"\toprule")
+    tex.append(r"$N$ & $r_{\text{true}}$ & Method & Selection distribution & Accuracy \\")
+    tex.append(r"\midrule")
+
+    for _, r in df.iterrows():
+        N = int(r["N"])
+        rt = int(r["r_true"])
+        method = _latex_escape(str(r["method"]))
+        dist = _latex_escape(str(r["selection_distribution"]))
+        acc = fmt_pct(r["accuracy"])
+        tex.append(f"{N} & {rt} & {method} & {dist} & {acc} \\\\")
+
+
+    tex.append(r"\bottomrule")
+    tex.append(r"\end{tabular}")
+    tex.append(r"\end{table}")
+    tex.append("")
+
+    out_path.write_text("\n".join(tex), encoding="utf-8")
+
+
+def generate_model_selection_brca_table(*, artifacts_dir: Path, out_path: Path) -> None:
+    """BRCA r-selection table with BIC, CV-MSE, and log-likelihood."""
+
+    path = artifacts_dir / "model_selection" / "brca" / "brca_r_selection.csv"
+    if not path.exists():
+        raise FileNotFoundError(f"missing: {path}")
+
+    df = pd.read_csv(path)
+
+    need = {"r", "bic", "cv_mse_mean", "cv_mse_std", "log_likelihood"}
+    missing = need - set(df.columns)
+    if missing:
+        raise ValueError(f"Unexpected BRCA model selection columns; missing={sorted(missing)}")
+
+    df = df.copy().sort_values("r")
+    df["r"] = df["r"].astype(int)
+
+    # Best values (ties broken by smaller r)
+    best_bic_r = int(df.sort_values(["bic", "r"], ascending=[True, True]).iloc[0]["r"])
+    best_cv_r = int(df.sort_values(["cv_mse_mean", "r"], ascending=[True, True]).iloc[0]["r"])
+    best_ll_r = int(df.sort_values(["log_likelihood", "r"], ascending=[False, True]).iloc[0]["r"])
+
+    def pm(mean: Any, std: Any) -> str:
+        try:
+            m = float(mean)
+            s = float(std)
+            return rf"\makecell{{{m:.4g}\\$\pm${s:.2g}}}"
+        except Exception:
+            return _latex_escape(f"{mean} ± {std}")
+
+    def maybe_bold(s: str, cond: bool) -> str:
+        return rf"\textbf{{{s}}}" if cond else s
+
+    tex: list[str] = []
+    tex.append(r"\begin{table}[t]\small")
+    tex.append(r"\centering")
+    K = 5
+    if "n_folds" in df.columns:
+        try:
+            K = int(df["n_folds"].iloc[0])
+        except Exception:
+            K = 5
+
+    tex.append(rf"\caption{{BRCA TCGA latent-dimension selection by BIC and {K}-fold CV prediction MSE. Best values are highlighted per criterion (BIC/CV-MSE: smaller is better; log-likelihood: larger is better).}}")
+
+    tex.append(r"\label{tab:model_selection_brca}")
+    tex.append(r"\setlength{\tabcolsep}{4pt}")
+    tex.append(r"\begin{tabular}{c|ccc}")
+    tex.append(r"\toprule")
+    tex.append(r"$r$ & BIC & CV-MSE ($\pm$ std) & Log-likelihood \\")
+    tex.append(r"\midrule")
+
+    for _, r in df.iterrows():
+        rr = int(r["r"])
+        bic_s = _format_sci_tex(r["bic"], sig=3)
+        cv_s = pm(r["cv_mse_mean"], r["cv_mse_std"])
+        ll_s = _format_sci_tex(r["log_likelihood"], sig=3)
+
+        bic_s = maybe_bold(bic_s, rr == best_bic_r)
+        cv_s = maybe_bold(cv_s, rr == best_cv_r)
+        ll_s = maybe_bold(ll_s, rr == best_ll_r)
+
+        tex.append(f"{rr} & {bic_s} & {cv_s} & {ll_s} \\\\")
+
+
+    tex.append(r"\bottomrule")
+    tex.append(r"\end{tabular}")
+    tex.append(r"\end{table}")
+    tex.append("")
+
+    out_path.write_text("\n".join(tex), encoding="utf-8")
+
 
 
 def generate_noise_ablation_exp2_table(*, artifacts_dir: Path, out_path: Path) -> None:
@@ -874,12 +1054,25 @@ def main() -> None:
     else:
         print(f"[SKIP] BRCA calibration table (missing: {brca_dir / 'brca_calibration_table.csv'})")
 
+    # Model selection tables (latent dimension r)
+    ms_dir = artifacts_dir / "model_selection"
+    if (ms_dir / "synthetic" / "selection_accuracy_table.csv").exists():
+        generate_model_selection_synthetic_table(artifacts_dir=artifacts_dir, out_path=out_dir / "tab_model_selection_synth.tex")
+    else:
+        print(f"[SKIP] Model selection (synthetic) table (missing: {ms_dir / 'synthetic' / 'selection_accuracy_table.csv'})")
+
+    if (ms_dir / "brca" / "brca_r_selection.csv").exists():
+        generate_model_selection_brca_table(artifacts_dir=artifacts_dir, out_path=out_dir / "tab_model_selection_brca.tex")
+    else:
+        print(f"[SKIP] Model selection (BRCA) table (missing: {ms_dir / 'brca' / 'brca_r_selection.csv'})")
+
     # Legacy coverage table (kept for backward compatibility).
     # (Some older paper drafts reference it.)
     try:
         generate_prediction_coverage_table(artifacts_dir=artifacts_dir, out_path=out_dir / "tab_prediction_coverage.tex")
     except FileNotFoundError as e:
         print(f"[SKIP] Legacy coverage table ({e})")
+
 
     generate_paper_metrics(artifacts_dir=artifacts_dir, out_path=paper_dir / "generated" / "metrics.tex")
 

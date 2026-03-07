@@ -114,16 +114,20 @@ def run_ridge_prediction(
     Y_test: np.ndarray,
     *,
     alphas: Optional[Sequence[float]] = None,
-    cv: int = 5,
+    cv: Optional[int] = 5,
 ) -> Dict:
-    """Ridge regression baseline (multi-output via per-dimension RidgeCV).
+    """Ridge regression baseline.
+
+    Two supported modes:
+    - If ``cv`` is an int: per-dimension RidgeCV with K-fold CV (can be expensive for large q).
+    - If ``cv`` is None: a single multi-output RidgeCV using generalized CV (fast; sklearn's default).
 
     Parameters
     ----------
     alphas:
         Candidate regularisation strengths. If None, defaults to logspace(-4,4,50).
     cv:
-        Inner CV folds used by RidgeCV.
+        Inner CV folds used by RidgeCV. Set to None to use generalized CV (recommended for BRCA).
 
     Returns a dict with keys: Y_pred, metrics (RegressionMetrics), alpha_per_dim.
     """
@@ -137,17 +141,28 @@ def run_ridge_prediction(
     )
 
     q = Y_train_s.shape[1]
-    Y_pred_s = np.zeros((X_test_s.shape[0], q), dtype=float)
-    alpha_per_dim = np.zeros(q, dtype=float)
 
-    for j in range(q):
-        ridge = RidgeCV(alphas=np.asarray(list(alphas), dtype=float), cv=int(cv))
-        ridge.fit(X_train_s, Y_train_s[:, j])
-        Y_pred_s[:, j] = ridge.predict(X_test_s)
+    if cv is None:
+        ridge = RidgeCV(alphas=np.asarray(list(alphas), dtype=float), cv=None)
+        ridge.fit(X_train_s, Y_train_s)
+        Y_pred_s = ridge.predict(X_test_s)
         try:
-            alpha_per_dim[j] = float(ridge.alpha_)
+            alpha = float(ridge.alpha_)
+            alpha_per_dim = np.full(q, alpha, dtype=float)
         except Exception:
-            alpha_per_dim[j] = np.nan
+            alpha_per_dim = np.full(q, np.nan, dtype=float)
+    else:
+        Y_pred_s = np.zeros((X_test_s.shape[0], q), dtype=float)
+        alpha_per_dim = np.zeros(q, dtype=float)
+
+        for j in range(q):
+            ridge = RidgeCV(alphas=np.asarray(list(alphas), dtype=float), cv=int(cv))
+            ridge.fit(X_train_s, Y_train_s[:, j])
+            Y_pred_s[:, j] = ridge.predict(X_test_s)
+            try:
+                alpha_per_dim[j] = float(ridge.alpha_)
+            except Exception:
+                alpha_per_dim[j] = np.nan
 
     Y_pred = sy.inverse_transform(Y_pred_s)
     metrics = compute_regression_metrics(Y_test, Y_pred)
@@ -157,3 +172,4 @@ def run_ridge_prediction(
         "metrics": metrics,
         "alpha_per_dim": alpha_per_dim,
     }
+

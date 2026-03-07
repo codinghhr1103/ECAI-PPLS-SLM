@@ -390,32 +390,13 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
         # 5) BRCA prediction benchmark (optional)
         if run_brca_prediction:
-            brca_pred_cfg = exp_cfg.get("prediction_brca", {})
-            brca_out = brca_pred_cfg.get("output_dir", "results_prediction_brca")
-
-            cmd = [sys.executable, "-u", "-m", "ppls_slm.apps.brca_prediction", "--output_dir", str(brca_out)]
-
-            # Use the bundled BRCA dataset by default.
-            brca_data_path = brca_pred_cfg.get("brca_data") or brca_data
-            if brca_data_path:
-                cmd += ["--brca_data", str(brca_data_path)]
-
-            for k in (
-                "seed",
-                "n_folds",
-                "r_grid",
-                "slm_n_starts",
-                "slm_max_iter",
-                "em_n_starts",
-                "em_max_iter",
-                "em_tol",
-            ):
-                if k in brca_pred_cfg and brca_pred_cfg.get(k) is not None:
-                    cmd += [f"--{k}", str(brca_pred_cfg.get(k))]
+            # This module reads all hyperparameters from config.json (single source of truth).
+            cmd = [sys.executable, "-u", "-m", "ppls_slm.apps.brca_prediction", "--config", str(config_path)]
 
             code = tee_run(cmd, cwd=repo_root, log_path=logs_dir / "05_brca_prediction.log", env=run_env)
             if code != 0:
                 return code
+
 
         # 6) BRCA calibration benchmark (optional)
         if run_brca_calibration:
